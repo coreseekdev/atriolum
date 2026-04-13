@@ -39,6 +39,50 @@ pub trait Store: Send + Sync + 'static {
         report_json: &[u8],
     ) -> Result<(), StoreError>;
 
+    /// Store structured log entries (appended as JSONL).
+    async fn store_logs(
+        &self,
+        project_id: &str,
+        log_json: &[u8],
+    ) -> Result<(), StoreError>;
+
+    /// Store a span (appended as JSONL).
+    async fn store_span(
+        &self,
+        project_id: &str,
+        span_json: &[u8],
+    ) -> Result<(), StoreError>;
+
+    /// Store a check-in (appended as JSONL).
+    async fn store_check_in(
+        &self,
+        project_id: &str,
+        check_in_json: &[u8],
+    ) -> Result<(), StoreError>;
+
+    /// Store a profile (raw JSON).
+    async fn store_profile(
+        &self,
+        project_id: &str,
+        profile_json: &[u8],
+    ) -> Result<(), StoreError>;
+
+    /// Store replay event data.
+    async fn store_replay(
+        &self,
+        project_id: &str,
+        replay_id: &str,
+        data: &[u8],
+    ) -> Result<(), StoreError>;
+
+    /// Store raw data for any unrecognized item type.
+    async fn store_raw(
+        &self,
+        project_id: &str,
+        item_type: &str,
+        data: &[u8],
+    ) -> Result<(), StoreError>;
+
     async fn get_project_config(
         &self,
         project_id: &str,

@@ -19,6 +19,15 @@ pub enum KnownItemType {
     Sessions,
     ClientReport,
     UserReport,
+    Log,
+    Span,
+    CheckIn,
+    Profile,
+    ProfileChunk,
+    ReplayEvent,
+    ReplayRecording,
+    Statsd,
+    MetricMeta,
 }
 
 impl KnownItemType {
@@ -31,6 +40,15 @@ impl KnownItemType {
             "sessions" => Some(Self::Sessions),
             "client_report" => Some(Self::ClientReport),
             "user_report" => Some(Self::UserReport),
+            "log" => Some(Self::Log),
+            "span" => Some(Self::Span),
+            "check_in" => Some(Self::CheckIn),
+            "profile" => Some(Self::Profile),
+            "profile_chunk" => Some(Self::ProfileChunk),
+            "replay_event" => Some(Self::ReplayEvent),
+            "replay_recording" => Some(Self::ReplayRecording),
+            "statsd" => Some(Self::Statsd),
+            "metric_meta" => Some(Self::MetricMeta),
             _ => None,
         }
     }

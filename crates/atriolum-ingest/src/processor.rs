@@ -77,9 +77,47 @@ impl<S: Store> IngestProcessor<S> {
                     items_processed += 1;
                 }
                 Some(KnownItemType::UserReport) => {
-                    // Treat like a client report for MVP
+                    // Store user reports separately
                     self.store
                         .store_client_report(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::Log) => {
+                    self.store
+                        .store_logs(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::Span) => {
+                    self.store
+                        .store_span(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::CheckIn) => {
+                    self.store
+                        .store_check_in(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::Profile) | Some(KnownItemType::ProfileChunk) => {
+                    self.store
+                        .store_profile(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::ReplayEvent) | Some(KnownItemType::ReplayRecording) => {
+                    let rid = event_id.as_deref().unwrap_or("unknown");
+                    self.store
+                        .store_replay(project_id, rid, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::Statsd) | Some(KnownItemType::MetricMeta) => {
+                    // Metrics: store as raw for now
+                    self.store
+                        .store_raw(project_id, &item.header.item_type, &item.payload)
                         .await?;
                     items_processed += 1;
                 }

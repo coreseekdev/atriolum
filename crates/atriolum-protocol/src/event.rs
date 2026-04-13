@@ -105,34 +105,218 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modules: Option<HashMap<String, String>>,
 
+    /// Structured log message (logentry format: {message, params}).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logentry: Option<LogEntry>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exception: Option<serde_json::Value>,
+    pub exception: Option<ExceptionValues>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub breadcrumbs: Option<serde_json::Value>,
+    pub breadcrumbs: Option<BreadcrumbValues>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contexts: Option<serde_json::Value>,
+    pub contexts: Option<HashMap<String, serde_json::Value>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<serde_json::Value>,
+    pub user: Option<User>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request: Option<serde_json::Value>,
+    pub request: Option<Request>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub threads: Option<serde_json::Value>,
+    pub threads: Option<ThreadValues>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdk: Option<SdkInfo>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub culprit: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_timestamp: Option<serde_json::Value>,
+
+    /// Transaction spans (for performance transactions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spans: Option<Vec<serde_json::Value>>,
+
+    /// Measurements (for performance transactions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<serde_json::Value>,
+
+    /// Transaction info.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_info: Option<serde_json::Value>,
+
+    /// Debug meta (proguard mappings, etc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_meta: Option<serde_json::Value>,
+
     #[serde(default)]
     pub errors: Vec<serde_json::Value>,
 
-    /// Catch-all for fields we don't explicitly handle
+    /// Catch-all for fields we don't explicitly handle.
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
+
+// --- Typed sub-structures for Event fields ---
+
+/// Structured log entry (Sentry `logentry` field).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub message: String,
+    #[serde(default)]
+    pub params: Vec<serde_json::Value>,
+}
+
+/// Wrapper for exception values (Sentry sends `{ "values": [...] }`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExceptionValues {
+    pub values: Vec<Exception>,
+}
+
+/// A single exception.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Exception {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exc_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacktrace: Option<Stacktrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_stacktrace: Option<Stacktrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
+
+/// Stack trace with frames.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stacktrace {
+    pub frames: Vec<Frame>,
+}
+
+/// A single stack frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Frame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abs_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineno: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colno: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_context: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_context: Option<Vec<String>>,
+    #[serde(default)]
+    pub in_app: Option<bool>,
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
+
+/// Wrapper for breadcrumb values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreadcrumbValues {
+    pub values: Vec<Breadcrumb>,
+}
+
+/// A single breadcrumb.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Breadcrumb {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<serde_json::Value>,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub breadcrumb_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<Level>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<HashMap<String, serde_json::Value>>,
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
+
+/// Wrapper for thread values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadValues {
+    pub values: Vec<Thread>,
+}
+
+/// A single thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Thread {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacktrace: Option<Stacktrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_stacktrace: Option<Stacktrace>,
+    #[serde(default)]
+    pub crashed: Option<bool>,
+    #[serde(default)]
+    pub current: Option<bool>,
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
+
+/// User information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
+
+/// HTTP request data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookies: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
     #[serde(flatten)]
     pub other: HashMap<String, serde_json::Value>,
 }

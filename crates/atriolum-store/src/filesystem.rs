@@ -41,6 +41,19 @@ impl FilesystemStore {
         fs::rename(&tmp_path, path).await?;
         Ok(())
     }
+
+    /// Append a line to a JSONL file.
+    async fn append_jsonl(&self, path: &Path, data: &[u8]) -> Result<(), StoreError> {
+        use tokio::io::AsyncWriteExt;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(data).await?;
+        file.write_all(b"\n").await?;
+        Ok(())
+    }
 }
 
 // We need Clone for sharing across handlers.
@@ -159,6 +172,93 @@ impl Store for FilesystemStore {
         self.atomic_write(&path, report_json).await?;
 
         tracing::debug!(%project_id, "stored client report");
+        Ok(())
+    }
+
+    async fn store_logs(
+        &self,
+        project_id: &str,
+        log_json: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("logs");
+        fs::create_dir_all(&dir).await?;
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{date}.jsonl"));
+        self.append_jsonl(&path, log_json).await?;
+        tracing::debug!(%project_id, "stored log entries");
+        Ok(())
+    }
+
+    async fn store_span(
+        &self,
+        project_id: &str,
+        span_json: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("spans");
+        fs::create_dir_all(&dir).await?;
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{date}.jsonl"));
+        self.append_jsonl(&path, span_json).await?;
+        tracing::debug!(%project_id, "stored span");
+        Ok(())
+    }
+
+    async fn store_check_in(
+        &self,
+        project_id: &str,
+        check_in_json: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("check_ins");
+        fs::create_dir_all(&dir).await?;
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{date}.jsonl"));
+        self.append_jsonl(&path, check_in_json).await?;
+        tracing::debug!(%project_id, "stored check-in");
+        Ok(())
+    }
+
+    async fn store_profile(
+        &self,
+        project_id: &str,
+        profile_json: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("profiles");
+        fs::create_dir_all(&dir).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let ts = Utc::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{ts}-{id}.json"));
+        self.atomic_write(&path, profile_json).await?;
+        tracing::debug!(%project_id, "stored profile");
+        Ok(())
+    }
+
+    async fn store_replay(
+        &self,
+        project_id: &str,
+        replay_id: &str,
+        data: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("replays").join(replay_id);
+        fs::create_dir_all(&dir).await?;
+        let path = dir.join("replay.json");
+        self.atomic_write(&path, data).await?;
+        tracing::debug!(%project_id, %replay_id, "stored replay");
+        Ok(())
+    }
+
+    async fn store_raw(
+        &self,
+        project_id: &str,
+        item_type: &str,
+        data: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("raw").join(item_type);
+        fs::create_dir_all(&dir).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let ts = Utc::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{ts}-{id}.bin"));
+        self.atomic_write(&path, data).await?;
+        tracing::debug!(%project_id, %item_type, "stored raw item");
         Ok(())
     }
 
