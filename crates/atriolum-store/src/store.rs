@@ -39,6 +39,13 @@ pub trait Store: Send + Sync + 'static {
         report_json: &[u8],
     ) -> Result<(), StoreError>;
 
+    /// Store a user report / feedback.
+    async fn store_user_report(
+        &self,
+        project_id: &str,
+        report_json: &[u8],
+    ) -> Result<(), StoreError>;
+
     /// Store structured log entries (appended as JSONL).
     async fn store_logs(
         &self,

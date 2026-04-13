@@ -77,9 +77,26 @@ impl<S: Store> IngestProcessor<S> {
                     items_processed += 1;
                 }
                 Some(KnownItemType::UserReport) => {
-                    // Store user reports separately
                     self.store
-                        .store_client_report(project_id, &item.payload)
+                        .store_user_report(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::Feedback) | Some(KnownItemType::UserFeedback) => {
+                    self.store
+                        .store_user_report(project_id, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::RawSecurity) => {
+                    self.store
+                        .store_raw(project_id, &item.header.item_type, &item.payload)
+                        .await?;
+                    items_processed += 1;
+                }
+                Some(KnownItemType::Metric) | Some(KnownItemType::TraceMetric) => {
+                    self.store
+                        .store_raw(project_id, &item.header.item_type, &item.payload)
                         .await?;
                     items_processed += 1;
                 }

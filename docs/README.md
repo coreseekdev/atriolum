@@ -106,6 +106,7 @@ data/
       profiles/{date}-{id}.json
       replays/{replay_id}/replay.json
       client_reports/{date}-{id}.json
+      user_reports/{date}-{id}.json
       raw/{item_type}/{date}-{id}.bin
 ```
 
@@ -115,6 +116,8 @@ data/
 |--------|------|-------------|
 | POST | `/api/{project_id}/envelope/` | Primary Sentry envelope endpoint |
 | POST | `/api/{project_id}/store/` | Legacy single event endpoint |
+| POST | `/api/{project_id}/minidump/` | C++ SDK minidump crash reports (multipart) |
+| POST | `/api/{project_id}/chunk-upload/` | Chunk upload for session replay |
 | GET | `/api/health` | Health check |
 | GET | `/ws/cli` | WebSocket for native CLI client |
 | GET | `/ws/term` | WebSocket for xterm.js web terminal |

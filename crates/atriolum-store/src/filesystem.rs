@@ -175,6 +175,23 @@ impl Store for FilesystemStore {
         Ok(())
     }
 
+    async fn store_user_report(
+        &self,
+        project_id: &str,
+        report_json: &[u8],
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id).join("user_reports");
+        fs::create_dir_all(&dir).await?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let ts = Utc::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{ts}-{id}.json"));
+        self.atomic_write(&path, report_json).await?;
+
+        tracing::debug!(%project_id, "stored user report/feedback");
+        Ok(())
+    }
+
     async fn store_logs(
         &self,
         project_id: &str,

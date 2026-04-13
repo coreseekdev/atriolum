@@ -38,6 +38,7 @@ futures-util = "0.3"
 
 # Compression
 flate2 = "1"
+brotli = "7"
 
 # Logging
 tracing = "0.1"

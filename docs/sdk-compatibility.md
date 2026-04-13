@@ -107,7 +107,7 @@ All SDKs support `gzip` and `identity`. Atriolum handles:
 - `identity` (no compression) ✅
 - `gzip` ✅
 - `deflate` (zlib-wrapped) ✅
-- `br` (brotli) — not yet implemented
+- `br` (brotli) ✅
 - `zstd` — not yet implemented
 
 ### Timestamp Formats

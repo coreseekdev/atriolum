@@ -19,6 +19,7 @@ pub enum KnownItemType {
     Sessions,
     ClientReport,
     UserReport,
+    Feedback,
     Log,
     Span,
     CheckIn,
@@ -28,6 +29,10 @@ pub enum KnownItemType {
     ReplayRecording,
     Statsd,
     MetricMeta,
+    Metric,
+    TraceMetric,
+    RawSecurity,
+    UserFeedback,
 }
 
 impl KnownItemType {
@@ -40,6 +45,7 @@ impl KnownItemType {
             "sessions" => Some(Self::Sessions),
             "client_report" => Some(Self::ClientReport),
             "user_report" => Some(Self::UserReport),
+            "feedback" => Some(Self::Feedback),
             "log" => Some(Self::Log),
             "span" => Some(Self::Span),
             "check_in" => Some(Self::CheckIn),
@@ -49,6 +55,10 @@ impl KnownItemType {
             "replay_recording" => Some(Self::ReplayRecording),
             "statsd" => Some(Self::Statsd),
             "metric_meta" => Some(Self::MetricMeta),
+            "metric" => Some(Self::Metric),
+            "trace_metric" => Some(Self::TraceMetric),
+            "raw_security" => Some(Self::RawSecurity),
+            "user_feedback" => Some(Self::UserFeedback),
             _ => None,
         }
     }

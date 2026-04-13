@@ -21,6 +21,14 @@ pub fn decompress_body(body: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, I
                 .map_err(|e| IngestError::Decompression(format!("deflate: {e}")))?;
             Ok(decompressed)
         }
+        Some("br") => {
+            let mut decoder = brotli::Decompressor::new(body, 4096);
+            let mut decompressed = Vec::with_capacity(body.len() * 2);
+            decoder
+                .read_to_end(&mut decompressed)
+                .map_err(|e| IngestError::Decompression(format!("brotli: {e}")))?;
+            Ok(decompressed)
+        }
         Some(enc) => Err(IngestError::Decompression(format!(
             "unsupported encoding: {enc}"
         ))),
@@ -63,6 +71,19 @@ mod tests {
 
     #[test]
     fn test_decompress_unsupported() {
-        assert!(decompress_body(b"data", Some("br")).is_err());
+        assert!(decompress_body(b"data", Some("zstd")).is_err());
+    }
+
+    #[test]
+    fn test_decompress_brotli() {
+        let original = b"hello brotli compressed world";
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut compressed, 4096, 4, 22);
+            encoder.write_all(original).unwrap();
+        }
+
+        let result = decompress_body(&compressed, Some("br")).unwrap();
+        assert_eq!(result, original);
     }
 }
