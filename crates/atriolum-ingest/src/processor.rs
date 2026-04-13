@@ -39,16 +39,19 @@ impl<S: Store> IngestProcessor<S> {
         for item in &envelope.items {
             match KnownItemType::from_str(&item.header.item_type) {
                 Some(KnownItemType::Event) => {
-                    let event: Event = serde_json::from_slice(&item.payload)?;
+                    let mut event: Event = serde_json::from_slice(&item.payload)?;
+                    // Inject envelope event_id if event doesn't have one
+                    let payload = inject_event_id(&mut event, &item.payload, envelope.header.event_id);
                     self.store
-                        .store_event(project_id, &event, &item.payload)
+                        .store_event(project_id, &event, &payload)
                         .await?;
                     items_processed += 1;
                 }
                 Some(KnownItemType::Transaction) => {
-                    let event: Event = serde_json::from_slice(&item.payload)?;
+                    let mut event: Event = serde_json::from_slice(&item.payload)?;
+                    let payload = inject_event_id(&mut event, &item.payload, envelope.header.event_id);
                     self.store
-                        .store_transaction(project_id, &event, &item.payload)
+                        .store_transaction(project_id, &event, &payload)
                         .await?;
                     items_processed += 1;
                 }
@@ -162,6 +165,25 @@ impl<S: Store> IngestProcessor<S> {
             items_skipped,
         })
     }
+}
+
+/// If the event doesn't have an event_id but the envelope does, inject it.
+/// Returns the (possibly modified) JSON payload.
+fn inject_event_id(
+    event: &mut Event,
+    raw_payload: &[u8],
+    envelope_event_id: Option<uuid::Uuid>,
+) -> Vec<u8> {
+    if event.event_id.is_none() {
+        if let Some(eid) = envelope_event_id {
+            event.event_id = Some(eid);
+            // Re-serialize with the injected ID
+            if let Ok(json) = serde_json::to_vec(&*event) {
+                return json;
+            }
+        }
+    }
+    raw_payload.to_vec()
 }
 
 /// Wrap a raw event JSON (from the legacy `/store/` endpoint) as an Envelope.

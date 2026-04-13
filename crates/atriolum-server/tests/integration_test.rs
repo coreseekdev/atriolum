@@ -299,3 +299,145 @@ fn test_server_rate_limit_headers() {
 
     let _ = server.kill();
 }
+
+#[test]
+fn test_management_api() {
+    let port = find_port();
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let data_dir = tmpdir.path().to_str().unwrap();
+
+    let mut server = Command::new("cargo")
+        .args([
+            "run",
+            "-p",
+            "atriolum-server",
+            "--",
+            "--port",
+            &port.to_string(),
+            "--data-dir",
+            data_dir,
+        ])
+        .env("RUST_LOG", "off")
+        .spawn()
+        .expect("failed to start server");
+
+    thread::sleep(Duration::from_secs(3));
+    let base = format!("http://127.0.0.1:{port}");
+
+    // 1. GET /api/0/projects/ — empty initially
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body == "[]", "expected empty projects, got: {body}");
+
+    // 2. POST /api/0/projects/ — create project
+    let result = Command::new("curl")
+        .args([
+            "-s",
+            "-X",
+            "POST",
+            &format!("{base}/api/0/projects/"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"name":"test-project","project_id":"42","public_key":"mykey123"}"#,
+        ])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("42"), "project create response: {body}");
+    assert!(body.contains("mykey123"), "project create response: {body}");
+
+    // 3. GET /api/0/projects/ — now has one project
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("test-project"), "projects list: {body}");
+
+    // 4. GET /api/0/projects/42/ — get single project
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/42/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("test-project"), "project detail: {body}");
+
+    // 5. POST event via SDK endpoint
+    let _ = Command::new("curl")
+        .args([
+            "-s",
+            "-X",
+            "POST",
+            &format!("{base}/api/42/envelope/"),
+            "-H",
+            "X-Sentry-Auth: Sentry sentry_version=7, sentry_key=mykey123",
+            "-H",
+            "Content-Type: application/x-sentry-envelope",
+            "-d",
+            &format!(
+                "{{\"event_id\":\"fc6d8c0c43fc4630ad850ee518f1b9d0\"}}\n{{\"type\":\"event\",\"length\":{}}}\n{{\"message\":\"test error\",\"level\":\"error\",\"platform\":\"python\",\"environment\":\"testing\"}}\n",
+                r#"{"message":"test error","level":"error","platform":"python","environment":"testing"}"#.len()
+            ),
+        ])
+        .output()
+        .unwrap();
+
+    // 6. GET /api/0/projects/42/events/ — list events
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/42/events/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("fc6d8c0c"), "events list: {body}");
+
+    // 7. GET /api/0/projects/42/events/?level=error — filtered
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/42/events/?level=error")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("fc6d8c0c"), "filtered events: {body}");
+
+    // 8. GET /api/0/projects/42/stats/
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/42/stats/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("total_events"), "stats: {body}");
+
+    // 9. GET /api/0/projects/42/releases/
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/42/releases/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body == "[]", "releases: {body}");
+
+    // 10. DELETE /api/0/projects/42/
+    let result = Command::new("curl")
+        .args([
+            "-s",
+            "-X",
+            "DELETE",
+            &format!("{base}/api/0/projects/42/"),
+        ])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("deleted"), "delete response: {body}");
+
+    // 11. Verify project is gone
+    let result = Command::new("curl")
+        .args(["-s", &format!("{base}/api/0/projects/42/")])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&result.stdout);
+    assert!(body.contains("not found"), "project should be deleted: {body}");
+
+    let _ = server.kill();
+}

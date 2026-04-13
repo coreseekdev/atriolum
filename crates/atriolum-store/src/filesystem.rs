@@ -1,21 +1,35 @@
 use async_trait::async_trait;
 use atriolum_protocol::{Event, EventSummary, ProjectConfig, ProjectKey};
 use chrono::Utc;
+use dashmap::DashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tracing;
 
 use crate::error::StoreError;
-use crate::query::EventFilter;
+use crate::query::{EventFilter, ProjectStats, ReleaseSummary};
 use crate::store::Store;
+
+/// Default broadcast channel capacity for live event streaming.
+const BROADCAST_CAPACITY: usize = 256;
 
 pub struct FilesystemStore {
     base_dir: PathBuf,
+    /// Per-project broadcast channels for live event streaming.
+    channels: Arc<DashMap<String, tokio::sync::broadcast::Sender<String>>>,
+    /// Global broadcast channel for all events.
+    global_channel: tokio::sync::broadcast::Sender<String>,
 }
 
 impl FilesystemStore {
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        let (global_tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            base_dir,
+            channels: Arc::new(DashMap::new()),
+            global_channel: global_tx,
+        }
     }
 
     /// Initialize the storage directory. Call once at startup.
@@ -54,15 +68,48 @@ impl FilesystemStore {
         file.write_all(b"\n").await?;
         Ok(())
     }
+
+    /// Broadcast an event to subscribers.
+    fn broadcast_event(&self, project_id: &str, event_json: &str) {
+        // Project-specific channel
+        if let Some(tx) = self.channels.get(project_id) {
+            let _ = tx.send(event_json.to_string());
+        } else {
+            let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+            let _ = tx.send(event_json.to_string());
+            self.channels.insert(project_id.to_string(), tx);
+        }
+        // Global channel
+        let _ = self.global_channel.send(event_json.to_string());
+    }
 }
 
-// We need Clone for sharing across handlers.
 impl Clone for FilesystemStore {
     fn clone(&self) -> Self {
         Self {
             base_dir: self.base_dir.clone(),
+            channels: self.channels.clone(),
+            global_channel: self.global_channel.clone(),
         }
     }
+}
+
+/// Check if an event matches a filter's query (text search).
+fn matches_query(event: &Event, query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+    let search_fields = [
+        event.message.as_deref(),
+        event.logger.as_deref(),
+        event.culprit.as_deref(),
+        event.transaction.as_deref(),
+        event.exception.as_ref().and_then(|ev| ev.values.first()?.exc_type.as_deref()),
+        event.exception.as_ref().and_then(|ev| ev.values.first()?.value.as_deref()),
+    ];
+    search_fields.iter().any(|field| {
+        field
+            .map(|f| f.to_lowercase().contains(&query_lower))
+            .unwrap_or(false)
+    })
 }
 
 #[async_trait]
@@ -84,6 +131,11 @@ impl Store for FilesystemStore {
 
         let path = dir.join(format!("{event_id}.json"));
         self.atomic_write(&path, raw_json).await?;
+
+        // Broadcast for live tail
+        if let Ok(json_str) = std::str::from_utf8(raw_json) {
+            self.broadcast_event(project_id, json_str);
+        }
 
         tracing::debug!(%project_id, %event_id, "stored event");
         Ok(())
@@ -125,7 +177,6 @@ impl Store for FilesystemStore {
         let mut line = session_json.to_vec();
         line.push(b'\n');
 
-        // Append to jsonl file
         use tokio::io::AsyncWriteExt;
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -327,7 +378,6 @@ impl Store for FilesystemStore {
         let limit = filter.limit.unwrap_or(100);
         let mut summaries = Vec::new();
 
-        // Read month directories in reverse chronological order
         let mut month_entries: Vec<_> = fs::read_dir(&events_dir)
             .await?
             .entries()
@@ -338,32 +388,88 @@ impl Store for FilesystemStore {
                 Some((name, e.path()))
             })
             .collect();
-        month_entries.sort_by(|a, b| b.0.cmp(&a.0)); // reverse order
+        month_entries.sort_by(|a, b| b.0.cmp(&a.0)); // reverse chronological
+
+        let mut past_cursor = filter.cursor.is_none();
 
         for (_month, month_path) in month_entries {
             if summaries.len() >= limit {
                 break;
             }
 
-            let mut file_entries = fs::read_dir(&month_path).await?;
-            while let Some(entry) = file_entries.next_entry().await? {
+            let mut file_entries: Vec<_> = fs::read_dir(&month_path)
+                .await?
+                .entries()
+                .await?
+                .into_iter()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // Sort by file modification time (newest first) — file name has event ID
+            file_entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+            for path in file_entries {
                 if summaries.len() >= limit {
                     break;
                 }
 
-                let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(data) = fs::read(&path).await {
-                        if let Ok(event) = serde_json::from_slice::<Event>(&data) {
-                            // Apply level filter
-                            if let Some(ref filter_level) = filter.level {
-                                if event.level != Some(*filter_level) {
-                                    continue;
+                if let Ok(data) = fs::read(&path).await {
+                    if let Ok(event) = serde_json::from_slice::<Event>(&data) {
+                        // Cursor: skip until we pass the cursor
+                        if !past_cursor {
+                            if let Some(ref cursor) = filter.cursor {
+                                let eid = event.event_id.map(|id| id.to_string()).unwrap_or_default();
+                                if eid == *cursor {
+                                    past_cursor = true;
                                 }
+                                continue;
                             }
-
-                            summaries.push(EventSummary::from_event(&event, project_id));
                         }
+
+                        // Apply level filter
+                        if let Some(ref filter_level) = filter.level {
+                            let el = event.level.map(|l| format!("{l:?}").to_lowercase());
+                            let el = el.as_deref();
+                            if el != Some(filter_level.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        // Apply platform filter
+                        if let Some(ref platform) = filter.platform {
+                            if event.platform.as_deref() != Some(platform.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        // Apply environment filter
+                        if let Some(ref env) = filter.environment {
+                            if event.environment.as_deref() != Some(env.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        // Apply release filter
+                        if let Some(ref rel) = filter.release {
+                            if event.release.as_deref() != Some(rel.as_str()) {
+                                continue;
+                            }
+                        }
+
+                        // Apply text query
+                        if let Some(ref query) = filter.query {
+                            if !matches_query(&event, query) {
+                                continue;
+                            }
+                        }
+
+                        summaries.push(EventSummary::from_event(&event, project_id));
                     }
                 }
             }
@@ -378,8 +484,6 @@ impl Store for FilesystemStore {
         event_id: &str,
     ) -> Result<Option<Event>, StoreError> {
         let events_dir = self.project_dir(project_id).join("events");
-
-        // Search across month directories
         if !events_dir.exists() {
             return Ok(None);
         }
@@ -395,6 +499,308 @@ impl Store for FilesystemStore {
         }
 
         Ok(None)
+    }
+
+    async fn get_transaction(
+        &self,
+        project_id: &str,
+        transaction_id: &str,
+    ) -> Result<Option<Event>, StoreError> {
+        let tx_dir = self.project_dir(project_id).join("transactions");
+        if !tx_dir.exists() {
+            return Ok(None);
+        }
+
+        let mut month_entries = fs::read_dir(&tx_dir).await?;
+        while let Some(entry) = month_entries.next_entry().await? {
+            let path = entry.path().join(format!("{transaction_id}.json"));
+            if path.exists() {
+                let data = fs::read(&path).await?;
+                let event = serde_json::from_slice(&data)?;
+                return Ok(Some(event));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn list_transactions(
+        &self,
+        project_id: &str,
+        filter: EventFilter,
+    ) -> Result<Vec<EventSummary>, StoreError> {
+        let tx_dir = self.project_dir(project_id).join("transactions");
+        if !tx_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let limit = filter.limit.unwrap_or(50);
+        let mut summaries = Vec::new();
+
+        let mut month_entries: Vec<_> = fs::read_dir(&tx_dir)
+            .await?
+            .entries()
+            .await?
+            .iter()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                Some((name, e.path()))
+            })
+            .collect();
+        month_entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (_month, month_path) in month_entries {
+            if summaries.len() >= limit {
+                break;
+            }
+
+            let mut file_entries: Vec<_> = fs::read_dir(&month_path)
+                .await?
+                .entries()
+                .await?
+                .into_iter()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            file_entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+            for path in file_entries {
+                if summaries.len() >= limit {
+                    break;
+                }
+
+                if let Ok(data) = fs::read(&path).await {
+                    if let Ok(event) = serde_json::from_slice::<Event>(&data) {
+                        if let Some(ref query) = filter.query {
+                            if !matches_query(&event, query) {
+                                continue;
+                            }
+                        }
+                        summaries.push(EventSummary::from_event(&event, project_id));
+                    }
+                }
+            }
+        }
+
+        Ok(summaries)
+    }
+
+    async fn get_project_stats(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectStats, StoreError> {
+        let project_dir = self.project_dir(project_id);
+        let mut stats = ProjectStats {
+            project_id: project_id.to_string(),
+            total_events: 0,
+            total_transactions: 0,
+            total_sessions: 0,
+            events_by_level: std::collections::HashMap::new(),
+            recent_errors: 0,
+            last_event_at: None,
+        };
+
+        // Count events
+        let events_dir = project_dir.join("events");
+        if events_dir.exists() {
+            let mut month_entries = fs::read_dir(&events_dir).await?;
+            while let Some(entry) = month_entries.next_entry().await? {
+                let files: Vec<_> = fs::read_dir(entry.path())
+                    .await?
+                    .entries()
+                    .await?
+                    .into_iter()
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| ext == "json")
+                            .unwrap_or(false)
+                    })
+                    .collect();
+
+                stats.total_events += files.len() as u64;
+
+                // Sample files for level breakdown and last event time
+                for file in &files {
+                    if let Ok(data) = fs::read(file.path()).await {
+                        if let Ok(event) = serde_json::from_slice::<Event>(&data) {
+                            let level_str = event
+                                .level
+                                .map(|l| format!("{l:?}").to_lowercase())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            *stats.events_by_level.entry(level_str).or_insert(0) += 1;
+
+                            if let Some(ts) = event.timestamp {
+                                let ts_str = ts.to_rfc3339();
+                                if stats.last_event_at.as_ref().map_or(true, |t| t < &ts_str) {
+                                    stats.last_event_at = Some(ts_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Count transactions
+        let tx_dir = project_dir.join("transactions");
+        if tx_dir.exists() {
+            let mut month_entries = fs::read_dir(&tx_dir).await?;
+            while let Some(entry) = month_entries.next_entry().await? {
+                let count = fs::read_dir(entry.path())
+                    .await?
+                    .entries()
+                    .await?
+                    .iter()
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| ext == "json")
+                            .unwrap_or(false)
+                    })
+                    .count();
+                stats.total_transactions += count as u64;
+            }
+        }
+
+        // Count sessions (by file size / line count approximation)
+        let sessions_dir = project_dir.join("sessions");
+        if sessions_dir.exists() {
+            let mut entries = fs::read_dir(&sessions_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if let Ok(data) = fs::read(entry.path()).await {
+                    stats.total_sessions += data.iter().filter(|&&b| b == b'\n').count() as u64;
+                }
+            }
+        }
+
+        // Recent errors (last 24h)
+        stats.recent_errors = stats
+            .events_by_level
+            .get("error")
+            .copied()
+            .unwrap_or(0)
+            + stats.events_by_level.get("fatal").copied().unwrap_or(0);
+
+        Ok(stats)
+    }
+
+    async fn list_releases(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ReleaseSummary>, StoreError> {
+        let events_dir = self.project_dir(project_id).join("events");
+        if !events_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut releases: std::collections::HashMap<String, ReleaseSummary> =
+            std::collections::HashMap::new();
+
+        let mut month_entries = fs::read_dir(&events_dir).await?;
+        while let Some(entry) = month_entries.next_entry().await? {
+            let files = fs::read_dir(entry.path())
+                .await?
+                .entries()
+                .await?;
+
+            for file in &files {
+                if file
+                    .path()
+                    .extension()
+                    .map(|e| e == "json")
+                    .unwrap_or(false)
+                {
+                    if let Ok(data) = fs::read(file.path()).await {
+                        if let Ok(event) = serde_json::from_slice::<Event>(&data) {
+                            if let Some(ref release) = event.release {
+                                let entry = releases.entry(release.clone()).or_insert_with(|| {
+                                    ReleaseSummary {
+                                        release: release.clone(),
+                                        environment: event.environment.clone(),
+                                        event_count: 0,
+                                        first_seen: None,
+                                        last_seen: None,
+                                    }
+                                });
+                                entry.event_count += 1;
+                                if let Some(ts) = event.timestamp {
+                                    let ts_str = ts.to_rfc3339();
+                                    if entry.first_seen.as_ref().map_or(true, |t| t > &ts_str) {
+                                        entry.first_seen = Some(ts_str.clone());
+                                    }
+                                    if entry.last_seen.as_ref().map_or(true, |t| t < &ts_str) {
+                                        entry.last_seen = Some(ts_str);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<_> = releases.into_values().collect();
+        result.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        Ok(result)
+    }
+
+    async fn list_attachments(
+        &self,
+        project_id: &str,
+        event_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let dir = self
+            .project_dir(project_id)
+            .join("attachments")
+            .join(event_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&dir).await?;
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
+        Ok(names)
+    }
+
+    async fn get_attachment(
+        &self,
+        project_id: &str,
+        event_id: &str,
+        filename: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let path = self
+            .project_dir(project_id)
+            .join("attachments")
+            .join(event_id)
+            .join(filename);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(&path).await?;
+        Ok(Some(data))
+    }
+
+    async fn delete_project(
+        &self,
+        project_id: &str,
+    ) -> Result<(), StoreError> {
+        let dir = self.project_dir(project_id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).await?;
+        }
+        self.channels.remove(project_id);
+        tracing::info!(%project_id, "deleted project");
+        Ok(())
     }
 
     async fn ensure_project(
@@ -413,7 +819,6 @@ impl Store for FilesystemStore {
             return Ok(config);
         }
 
-        // Create new project config
         let config = ProjectConfig {
             project_id: project_id.to_string(),
             project_name: name.to_string(),
@@ -429,11 +834,19 @@ impl Store for FilesystemStore {
         tracing::info!(%project_id, %name, "created project");
         Ok(config)
     }
+
+    fn subscribe_events(&self, project_id: &str) -> tokio::sync::broadcast::Receiver<String> {
+        if let Some(tx) = self.channels.get(project_id) {
+            tx.subscribe()
+        } else {
+            let (tx, rx) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+            self.channels.insert(project_id.to_string(), tx);
+            rx
+        }
+    }
 }
 
 // Helper for read_dir entries
-use tokio::io::AsyncWriteExt;
-
 trait DirEntriesExt {
     async fn entries(self) -> Result<Vec<fs::DirEntry>, std::io::Error>;
 }

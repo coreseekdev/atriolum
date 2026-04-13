@@ -6,7 +6,7 @@ mod ws;
 use atriolum_ingest::{decompress_body, validate_auth, IngestProcessor, MAX_COMPRESSED_SIZE};
 use atriolum_ingest::processor::wrap_event_as_envelope;
 use atriolum_protocol::parse_envelope;
-use atriolum_store::{FilesystemStore, Store};
+use atriolum_store::{EventFilter, FilesystemStore, Store};
 
 use clap::Parser;
 use http_body_util::{BodyExt, Full};
@@ -15,6 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -142,8 +143,12 @@ async fn handle_request(
         return handle_ws_upgrade(req, state, ws::WsTarget::Term).await;
     }
 
-    // Routes: POST /api/{project_id}/{endpoint}
-    // Accept with or without trailing slash (parts.len() 3 or 4 with empty)
+    // --- Management API (/api/0/...) ---
+    if parts.len() >= 2 && parts[0] == "api" && parts[1] == "0" {
+        return Ok(handle_management_api(method, parts, req, state, &query).await);
+    }
+
+    // --- SDK Ingest endpoints ---
     if method == Method::POST && parts.len() >= 3 && parts[0] == "api" {
         let project_id = parts[1];
         let endpoint = parts[2];
@@ -170,6 +175,75 @@ async fn handle_request(
     }
 
     Ok(error_response(StatusCode::NOT_FOUND, "not found"))
+}
+
+/// Handle management API requests (/api/0/...).
+async fn handle_management_api(
+    method: Method,
+    parts: Vec<&str>,
+    req: Request<hyper::body::Incoming>,
+    state: &Arc<AppState>,
+    query: &str,
+) -> Response<BoxBody> {
+    // GET /api/0/projects/
+    if method == Method::GET && parts == ["api", "0", "projects"] {
+        return api_list_projects(state).await;
+    }
+
+    // POST /api/0/projects/
+    if method == Method::POST && parts == ["api", "0", "projects"] {
+        return api_create_project(req, state).await;
+    }
+
+    // Routes with project_id: /api/0/projects/{id}/...
+    if parts.len() >= 4 && parts[0] == "api" && parts[1] == "0" && parts[2] == "projects" {
+        let project_id = parts[3];
+
+        // GET /api/0/projects/{id}/
+        if method == Method::GET && parts.len() == 4 {
+            return api_get_project(state, project_id).await;
+        }
+
+        // DELETE /api/0/projects/{id}/
+        if method == Method::DELETE && parts.len() == 4 {
+            return api_delete_project(state, project_id).await;
+        }
+
+        // Sub-resources under project
+        if parts.len() >= 5 {
+            let resource = parts[4];
+
+            match resource {
+                // GET /api/0/projects/{id}/events/
+                "events" if method == Method::GET && parts.len() == 5 => {
+                    return api_list_events(state, project_id, query).await;
+                }
+                // GET /api/0/projects/{id}/events/{eid}/
+                "events" if method == Method::GET && parts.len() == 6 => {
+                    return api_get_event(state, project_id, parts[5]).await;
+                }
+                // GET /api/0/projects/{id}/transactions/
+                "transactions" if method == Method::GET && parts.len() == 5 => {
+                    return api_list_transactions(state, project_id, query).await;
+                }
+                // GET /api/0/projects/{id}/stats/
+                "stats" if method == Method::GET && parts.len() == 5 => {
+                    return api_get_stats(state, project_id).await;
+                }
+                // GET /api/0/projects/{id}/releases/
+                "releases" if method == Method::GET && parts.len() == 5 => {
+                    return api_list_releases(state, project_id).await;
+                }
+                // GET /api/0/projects/{id}/attachments/{eid}/
+                "attachments" if method == Method::GET && parts.len() == 6 => {
+                    return api_list_attachments(state, project_id, parts[5]).await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    error_response(StatusCode::NOT_FOUND, "not found")
 }
 
 /// Handle multipart minidump upload from C++ SDK.
@@ -361,6 +435,174 @@ async fn handle_chunk_upload(
 
     json_response(StatusCode::OK, &format!("{{\"id\":\"{chunk_id}\"}}"))
 }
+
+// ---- Management API handlers ----
+
+async fn api_list_projects(state: &Arc<AppState>) -> Response<BoxBody> {
+    match state.store.list_projects().await {
+        Ok(projects) => {
+            let body = serde_json::to_string(&projects).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_create_project(
+    req: Request<hyper::body::Incoming>,
+    state: &Arc<AppState>,
+) -> Response<BoxBody> {
+    let body_bytes = match collect_body(req.into_body(), 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string()),
+    };
+
+    let input: HashMap<String, String> = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+    };
+
+    let name = input.get("name").map(|s| s.as_str()).unwrap_or("unnamed");
+    let public_key = input
+        .get("public_key")
+        .cloned()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let project_id = input
+        .get("project_id")
+        .cloned()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    match state.store.ensure_project(&project_id, name, &public_key).await {
+        Ok(config) => {
+            let body = serde_json::to_string(&config).unwrap_or_default();
+            json_response(StatusCode::CREATED, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_get_project(state: &Arc<AppState>, project_id: &str) -> Response<BoxBody> {
+    match state.store.get_project_config(project_id).await {
+        Ok(Some(config)) => {
+            let body = serde_json::to_string(&config).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "project not found"),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_delete_project(state: &Arc<AppState>, project_id: &str) -> Response<BoxBody> {
+    match state.store.delete_project(project_id).await {
+        Ok(()) => json_response(StatusCode::OK, "{\"detail\":\"deleted\"}"),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_list_events(state: &Arc<AppState>, project_id: &str, query: &str) -> Response<BoxBody> {
+    let filter = parse_event_filter(query);
+    match state.store.list_events(project_id, filter).await {
+        Ok(events) => {
+            let body = serde_json::to_string(&events).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_get_event(state: &Arc<AppState>, project_id: &str, event_id: &str) -> Response<BoxBody> {
+    match state.store.get_event(project_id, event_id).await {
+        Ok(Some(event)) => {
+            let body = serde_json::to_string(&event).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "event not found"),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_list_transactions(state: &Arc<AppState>, project_id: &str, query: &str) -> Response<BoxBody> {
+    let filter = parse_event_filter(query);
+    match state.store.list_transactions(project_id, filter).await {
+        Ok(txs) => {
+            let body = serde_json::to_string(&txs).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_get_stats(state: &Arc<AppState>, project_id: &str) -> Response<BoxBody> {
+    match state.store.get_project_stats(project_id).await {
+        Ok(stats) => {
+            let body = serde_json::to_string(&stats).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_list_releases(state: &Arc<AppState>, project_id: &str) -> Response<BoxBody> {
+    match state.store.list_releases(project_id).await {
+        Ok(releases) => {
+            let body = serde_json::to_string(&releases).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn api_list_attachments(state: &Arc<AppState>, project_id: &str, event_id: &str) -> Response<BoxBody> {
+    match state.store.list_attachments(project_id, event_id).await {
+        Ok(names) => {
+            let body = serde_json::to_string(&names).unwrap_or_default();
+            json_response(StatusCode::OK, &body)
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Parse query string into EventFilter.
+fn parse_event_filter(query: &str) -> EventFilter {
+    let mut filter = EventFilter::default();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let v = urldecode(v);
+            match k {
+                "level" => filter.level = Some(v),
+                "limit" => filter.limit = v.parse().ok(),
+                "cursor" => filter.cursor = Some(v),
+                "platform" => filter.platform = Some(v),
+                "query" => filter.query = Some(v),
+                "environment" => filter.environment = Some(v),
+                "release" => filter.release = Some(v),
+                _ => {}
+            }
+        }
+    }
+    filter
+}
+
+/// Simple URL percent-decoding.
+fn urldecode(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+// ---- SDK Ingest Handlers ----
 
 async fn handle_envelope(
     req: Request<hyper::body::Incoming>,
@@ -571,13 +813,11 @@ async fn collect_body(
 /// Handle WebSocket upgrade for /ws/cli and /ws/term.
 async fn handle_ws_upgrade(
     req: Request<hyper::body::Incoming>,
-    _state: &Arc<AppState>,
+    state: &Arc<AppState>,
     target: ws::WsTarget,
 ) -> anyhow::Result<Response<BoxBody>> {
-    
     use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
-    // Check for WebSocket upgrade headers
     let ws_key = req
         .headers()
         .get("sec-websocket-key")
@@ -585,23 +825,32 @@ async fn handle_ws_upgrade(
 
     let derived = derive_accept_key(ws_key.as_bytes());
 
-    let _upgraded = req.into_body();
+    // Spawn a task to handle the upgraded connection
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        // Wait for the HTTP upgrade to complete
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                match target {
+                    ws::WsTarget::Cli => {
+                        ws::handle_cli_ws(upgraded, state_clone).await;
+                    }
+                    ws::WsTarget::Term => {
+                        tracing::info!("Terminal WebSocket connected (not yet implemented)");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("WebSocket upgrade failed: {e}");
+            }
+        }
+    });
 
-    // Extract the OnUpgrade from the request parts
-    // We need to use hyper's upgrade mechanism
-    let response = Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("upgrade", "websocket")
         .header("connection", "upgrade")
         .header("sec-websocket-accept", derived)
         .body(full_body(""))
-        .unwrap();
-
-    // Spawn a task to handle the upgraded connection
-    // For now, just return the upgrade response without actual WS handling
-    // Full WebSocket support will be implemented in the ws module
-
-    tracing::info!(?target, "WebSocket connection requested");
-
-    Ok(response)
+        .unwrap())
 }

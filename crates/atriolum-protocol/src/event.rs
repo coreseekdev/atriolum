@@ -345,10 +345,24 @@ pub struct EventSummary {
     pub timestamp: Option<String>,
     pub message: Option<String>,
     pub project_id: String,
+    pub environment: Option<String>,
+    pub release: Option<String>,
+    pub exception_type: Option<String>,
+    pub culprit: Option<String>,
 }
 
 impl EventSummary {
     pub fn from_event(event: &Event, project_id: &str) -> Self {
+        let exception_type = event
+            .exception
+            .as_ref()
+            .and_then(|ev| ev.values.first())
+            .and_then(|ex| {
+                ex.exc_type
+                    .clone()
+                    .or_else(|| ex.value.clone())
+            });
+
         Self {
             event_id: event
                 .event_id
@@ -357,8 +371,25 @@ impl EventSummary {
             level: event.level,
             platform: event.platform.clone(),
             timestamp: event.timestamp.map(|t| t.to_rfc3339()),
-            message: event.message.clone(),
+            message: event.message.clone().or_else(|| {
+                event
+                    .exception
+                    .as_ref()
+                    .and_then(|ev| ev.values.first())
+                    .and_then(|ex| {
+                        match (&ex.exc_type, &ex.value) {
+                            (Some(t), Some(v)) => Some(format!("{t}: {v}")),
+                            (Some(t), None) => Some(t.clone()),
+                            (None, Some(v)) => Some(v.clone()),
+                            _ => None,
+                        }
+                    })
+            }),
             project_id: project_id.to_string(),
+            environment: event.environment.clone(),
+            release: event.release.clone(),
+            exception_type,
+            culprit: event.culprit.clone(),
         }
     }
 }
