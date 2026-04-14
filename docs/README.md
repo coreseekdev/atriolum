@@ -53,41 +53,56 @@ let _guard = sentry::init(("http://testkey@localhost:8000/1", sentry::ClientOpti
 sentry.Init(sentry.ClientOptions{Dsn: "http://testkey@localhost:8000/1"})
 ```
 
+### C++
+
+```c
+sentry_options_set_dsn(opts, "http://testkey@localhost:8000/1");
+```
+
 ## CLI Client
 
 ```bash
 # Single command mode
-atriolum-cli events list --server ws://localhost:8000/ws/cli
-atriolum-cli events show <event_id>
+atriolum-cli events list --project 1 --level error --limit 10
+atriolum-cli events show fc6d8c0c43fc4630ad850ee518f1b9d0 --project 1
 atriolum-cli projects list
+atriolum-cli projects create --name my-app
+atriolum-cli stats --project 1
+atriolum-cli releases --project 1
+atriolum-cli transactions --project 1
+atriolum-cli tail                    # live event stream (WebSocket)
 
 # Interactive REPL mode
-atriolum-cli --server ws://localhost:8000/ws/cli
-atriolum> events list --level error --limit 10
+atriolum-cli
+atriolum> events list -p 1 -l error -n 10
 atriolum> events show fc6d8c0c43fc4630ad850ee518f1b9d0
 atriolum> projects list
+atriolum> stats -p 1
 atriolum> exit
 ```
 
 ## Architecture
 
 ```
-Sentry SDKs  →  HTTP POST (Envelope/Store)  →  atriolum-server (hyper+tower)
-                                                   ↓
-                                            atriolum-ingest (parse, auth, decompress)
-                                                   ↓
-                                            atriolum-store (filesystem storage)
+Sentry SDKs  →  HTTP POST (Envelope/Store/Minidump)  →  atriolum-server (hyper)
+                                                              ↓
+                                                       atriolum-ingest (parse, auth, decompress)
+                                                              ↓
+                                                       atriolum-store (filesystem storage)
+                                                              ↓
+CLI Client   →  HTTP REST (management API)  +  WebSocket (live tail)
+Browser      →  WebSocket (/ws/term, /ws/cli)
 ```
 
 ## Workspace Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `atriolum-protocol` | Sentry protocol types: Event, Envelope, Auth, DSN, Session, Log, Span |
-| `atriolum-store` | Filesystem storage layer with `Store` trait |
-| `atriolum-ingest` | Envelope parsing, auth validation, decompression |
-| `atriolum-server` | hyper+tower HTTP server with WebSocket endpoints |
-| `atriolum-cli` | Native CLI client (WebSocket + interactive REPL) |
+| `atriolum-protocol` | Sentry protocol types: Event, Envelope, Auth, DSN, Session, Log, Span, CheckIn |
+| `atriolum-store` | Filesystem storage with `Store` trait, broadcast channels for live tail |
+| `atriolum-ingest` | Envelope parsing, auth validation, decompression (gzip/deflate/brotli) |
+| `atriolum-server` | hyper HTTP server + WebSocket endpoints |
+| `atriolum-cli` | Native CLI client (HTTP REST + interactive REPL) |
 
 ## Storage Layout
 
@@ -112,15 +127,60 @@ data/
 
 ## API Endpoints
 
+### SDK Ingest (used by Sentry SDKs)
+
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/{project_id}/envelope/` | Primary Sentry envelope endpoint |
 | POST | `/api/{project_id}/store/` | Legacy single event endpoint |
 | POST | `/api/{project_id}/minidump/` | C++ SDK minidump crash reports (multipart) |
 | POST | `/api/{project_id}/chunk-upload/` | Chunk upload for session replay |
+
+### Management API (used by CLI)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/0/projects/` | List all projects |
+| POST | `/api/0/projects/` | Create a project |
+| GET | `/api/0/projects/{id}/` | Get project details |
+| DELETE | `/api/0/projects/{id}/` | Delete a project |
+| GET | `/api/0/projects/{id}/events/` | List events (with filters) |
+| GET | `/api/0/projects/{id}/events/{eid}/` | Get single event |
+| GET | `/api/0/projects/{id}/transactions/` | List transactions |
+| GET | `/api/0/projects/{id}/stats/` | Project statistics |
+| GET | `/api/0/projects/{id}/releases/` | List releases |
+| GET | `/api/0/projects/{id}/attachments/{eid}/` | List event attachments |
+
+### Event Query Parameters
+
+| Param | Description |
+|-------|-------------|
+| `level` | Filter by level (fatal/error/warning/info/debug) |
+| `platform` | Filter by platform (python/javascript/rust/go/native) |
+| `environment` | Filter by environment |
+| `release` | Filter by release version |
+| `query` | Full-text search (message, exception, logger) |
+| `limit` | Max results (default 20) |
+| `cursor` | Pagination cursor |
+
+### Other Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
 | GET | `/api/health` | Health check |
 | GET | `/ws/cli` | WebSocket for native CLI client |
 | GET | `/ws/term` | WebSocket for xterm.js web terminal |
+| OPTIONS | * | CORS preflight |
+
+## Content-Encoding Support
+
+| Encoding | Status |
+|----------|--------|
+| identity (none) | Supported |
+| gzip | Supported |
+| deflate (zlib) | Supported |
+| br (brotli) | Supported |
+| zstd | Not yet implemented |
 
 ## License
 

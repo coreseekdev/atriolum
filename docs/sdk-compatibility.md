@@ -18,9 +18,11 @@ Verified compatibility with official Sentry SDKs. All tests run against a live A
 | Release/Environment | ✅ | Set via `init()` params |
 | Contexts (runtime, trace) | ✅ | Auto-added by SDK |
 | Structured logging | ✅ | `_experiments={"enable_logs": True}` → logs stored as JSONL |
-| Sessions | ⚠️ | Sent but not yet verified (depends on process exit timing) |
-| Attachments | Not tested | |
-| Transactions | Not tested | |
+| Sessions | ✅ | Sent and stored as JSONL |
+| Attachments | ✅ | Stored as binary files |
+| Transactions | ✅ | Stored with span data |
+| gzip compression | ✅ | Decompressed server-side |
+| brotli compression | ✅ | Decompressed server-side |
 
 ### DSN Configuration
 
@@ -39,6 +41,8 @@ Python SDK sends these envelope item types:
 - `log` — structured log entries (experimental)
 - `client_report` — counts of dropped events
 - `attachment` — file attachments
+- `check_in` — cron monitor check-ins
+- `profile` — performance profiles
 
 ---
 
@@ -55,11 +59,11 @@ Sentry.init({ dsn: "http://testkey@localhost:8000/1" });
 ### Envelope Items Expected
 
 JavaScript SDK sends:
-- `event`, `transaction`, `session`, `log`, `span`
+- `event`, `transaction`, `session`, `sessions`, `log`, `span`
 - `profile`, `profile_chunk`
 - `replay_event`, `replay_recording`
-- `client_report`, `user_report`
-- `check_in`, `attachment`, `trace_metric`
+- `client_report`, `user_report`, `feedback`
+- `check_in`, `attachment`, `trace_metric`, `metric`
 
 ---
 
@@ -76,14 +80,14 @@ let _guard = sentry::init(("http://testkey@localhost:8000/1", sentry::ClientOpti
 ### Envelope Items Expected
 
 Rust SDK sends:
-- `event`, `transaction`, `session`, `attachment`
-- `session_aggregates`, `monitor_check_in`
+- `event`, `transaction`, `session`, `sessions`, `attachment`
+- `session_aggregates`, `check_in`
 
 ---
 
 ## C++ (sentry-native)
 
-**Not yet tested**. Expected to work for standard events.
+**Not yet tested**. Minidump endpoint implemented.
 
 ### Expected DSN
 
@@ -95,7 +99,29 @@ sentry_options_set_dsn(opts, "http://testkey@localhost:8000/1");
 
 C++ SDK sends:
 - `event`, `transaction`, `session`, `attachment`, `client_report`
-- Also sends minidump crash reports to `/api/{id}/minidump/` (not yet implemented)
+- Minidump crash reports via `POST /api/{id}/minidump/` (multipart/form-data) ✅
+
+---
+
+## Server Feature Matrix
+
+| Feature | Status |
+|---------|--------|
+| Envelope endpoint | ✅ |
+| Legacy store endpoint | ✅ |
+| Minidump endpoint (multipart) | ✅ |
+| Chunk upload endpoint | ✅ |
+| gzip decompression | ✅ |
+| deflate decompression | ✅ |
+| brotli decompression | ✅ |
+| Rate limit response headers | ✅ |
+| CORS headers | ✅ |
+| Auto-create projects | ✅ |
+| Event ID injection | ✅ |
+| Management REST API | ✅ |
+| Live event tail (WebSocket) | ✅ |
+| zstd decompression | ❌ Not yet |
+| `sent_at` clock drift correction | ❌ Not yet |
 
 ---
 
@@ -125,7 +151,7 @@ SDKs send event IDs as 32-char hex strings without dashes:
 "fc6d8c0c43fc4630ad850ee518f1b9d0"
 ```
 
-UUID library parses these correctly. When returning IDs in responses, Atriolum returns the hyphenated UUID format (what `Uuid::to_string()` produces).
+UUID library parses these correctly. When returning IDs in responses, Atriolum returns the hyphenated UUID format.
 
 ### CORS
 
@@ -136,4 +162,10 @@ Access-Control-Allow-Origin: *
 
 ### Unknown Item Types
 
-If an SDK sends an envelope item type that Atriolum doesn't recognize, it logs a warning and skips the item. Other items in the same envelope are still processed. This follows the Sentry protocol recommendation.
+If an SDK sends an envelope item type that Atriolum doesn't recognize, it logs a warning and stores it as raw data. Other items in the same envelope are still processed.
+
+### Known Item Types
+
+All these types are recognized and routed to appropriate storage:
+
+`event`, `transaction`, `session`, `sessions`, `attachment`, `client_report`, `user_report`, `feedback`, `user_feedback`, `log`, `span`, `check_in`, `profile`, `profile_chunk`, `replay_event`, `replay_recording`, `statsd`, `metric_meta`, `metric`, `trace_metric`, `raw_security`

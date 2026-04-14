@@ -1,0 +1,813 @@
+-- allium: 3
+-- Atriolum: Sentry-compatible error tracking server
+-- Models event ingestion, storage, and management API behaviour
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    store: EventStore
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Sentry SDK client that sends events
+external entity SentryClient {
+    sdk_name: String
+    sdk_version: String
+    platform: String
+}
+
+-- User of the management API
+external entity ApiUser {
+    user_id: String?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Severity level of an event
+value Level {
+    value: fatal | error | warning | info | debug
+}
+
+-- Session status from SDK
+value SessionStatus {
+    value: ok | exited | crashed | abnormal
+}
+
+-- Check-in status for cron monitors
+value CheckInStatus {
+    value: ok | error | in_progress
+}
+
+-- Monitor schedule type
+value MonitorSchedule {
+    schedule_type: crontab | interval
+    value: String
+    interval_unit: String?
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Envelope item types recognised by the ingest system
+enum ItemType {
+    event
+    transaction
+    attachment
+    session
+    sessions
+    client_report
+    user_report
+    feedback
+    log
+    span
+    check_in
+    profile
+    profile_chunk
+    replay_event
+    replay_recording
+    metric
+    trace_metric
+    raw_security
+    statsd
+    metric_meta
+    user_feedback
+    unknown
+}
+
+-- Authentication sources
+enum AuthSource {
+    header
+    query
+    envelope_dsn
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A project that receives and stores events
+entity Project {
+    -- Fields
+    project_id: String
+    name: String
+    public_key: String
+    created_at: Timestamp
+
+    -- Relationships
+    events: StoredEvent with project = this
+    transactions: StoredEvent with project = this and is_transaction = true
+    sessions: SessionUpdate with project = this
+    attachments: StoredAttachment with project = this
+    check_ins: CheckIn with project = this
+
+    -- Projections
+    recent_events: events where timestamp > now - 24.hours
+    error_events: events where level in {error, fatal}
+
+    -- Derived
+    event_count: events.count
+    has_recent_activity: recent_events.count > 0
+}
+
+-- An error event stored in the system
+entity StoredEvent {
+    -- Fields
+    event_id: String
+    project: Project
+    timestamp: Timestamp
+    level: Level
+    platform: String?
+    message: String?
+    environment: String?
+    release: String?
+    transaction_name: String?
+    is_transaction: Boolean
+    raw_json: String
+
+    -- Relationships
+    project: Project with events contains this
+    attachments: StoredAttachment with event = this
+
+    -- Derived
+    is_error: level in {error, fatal}
+    is_recent: timestamp > now - 24.hours
+}
+
+-- A session state update
+entity SessionUpdate {
+    session_id: String
+    project: Project
+    distinct_id: String?
+    started: Timestamp
+    status: SessionStatus
+    duration: Decimal?
+    error_count: Integer
+    release: String?
+    environment: String?
+    timestamp: Timestamp
+
+    -- Relationships
+    project: Project with sessions contains this
+}
+
+-- A file attachment associated with an event
+entity StoredAttachment {
+    attachment_id: String
+    event: StoredEvent
+    project: Project
+    filename: String
+    content_type: String?
+    file_path: String
+    size: Integer
+    uploaded_at: Timestamp
+
+    -- Relationships
+    event: StoredEvent with attachments contains this
+    project: Project with attachments contains this
+}
+
+-- Cron monitor check-in
+entity CheckIn {
+    check_in_id: String?
+    project: Project
+    monitor_slug: String
+    status: CheckInStatus
+    duration: Decimal?
+    schedule: MonitorSchedule
+    release: String?
+    environment: String?
+    timestamp: Timestamp
+
+    -- Relationships
+    project: Project with check_ins contains this
+
+    -- Derived
+    is_failed: status = error
+}
+
+-- Authentication credentials from an incoming request
+entity AuthCredentials {
+    sentry_key: String
+    sentry_version: Integer
+    sentry_client: String?
+    sentry_secret: String?
+    auth_source: AuthSource
+    validated_at: Timestamp
+
+    -- Derived
+    is_valid_version: sentry_version = 7
+}
+
+-- An envelope received from a Sentry SDK
+entity Envelope {
+    envelope_id: String
+    project: Project
+    event_id: String?
+    sent_at: Timestamp?
+    sdk_name: String?
+    sdk_version: String?
+    auth: AuthCredentials?
+    received_at: Timestamp
+    items_processed: Integer
+    items_skipped: Integer
+
+    -- Relationships
+    project: Project
+
+    -- Derived
+    has_auth: auth != null
+    processing_complete: items_processed > 0 or items_skipped > 0
+}
+
+-- An individual item within an envelope
+entity EnvelopeItem {
+    item_type: ItemType
+    payload: String
+    filename: String?
+    content_type: String?
+    length: Integer?
+    envelope: Envelope
+
+    -- Derived
+    is_event: item_type in {event, transaction}
+    is_attachment: item_type = attachment
+    is_session: item_type in {session, sessions}
+}
+
+-- WebSocket connection for live event streaming
+entity WebSocketConnection {
+    connection_id: String
+    project: Project?
+    connected_at: Timestamp
+    last_ping: Timestamp
+    is_active: Boolean
+
+    -- Relationships
+    project: Project
+
+    -- Derived
+    is_stale: last_ping < now - 5.minutes
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Maximum size for compressed request body
+    max_compressed_size: Integer = 20_971_520
+
+    -- Maximum size for individual event payload
+    max_event_size: Integer = 1_048_576
+
+    -- Broadcast channel capacity for live event streaming
+    broadcast_capacity: Integer = 256
+
+    -- Project auto-creation on first event
+    auto_create_projects: Boolean = true
+
+    -- WebSocket ping interval
+    ws_ping_interval: Duration = 1.minutes
+
+    -- WebSocket timeout for stale connections
+    ws_stale_timeout: Duration = 5.minutes
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Authentication and validation flow
+
+rule ValidateEnvelopeAuth {
+    when: EnvelopeReceived(envelope, auth_header, query_string)
+
+    let project = envelope.project
+    let credentials = ParseAuthCredentials(auth_header, query_string, envelope.dsn)
+
+    requires:
+        credentials != null
+        credentials.is_valid_version
+
+    ensures:
+        envelope.auth = credentials
+        AuthValidated(envelope: envelope, project: project)
+}
+
+rule AuthenticateViaHeader {
+    when: EnvelopeReceived(envelope, auth_header, _)
+
+    requires:
+        auth_header != null
+
+    let credentials = parse_sentry_auth(auth_header)
+    let project = envelope.project
+
+    requires:
+        credentials != null
+        project.public_key = credentials.sentry_key
+
+    ensures:
+        envelope.auth = credentials
+        envelope.auth.auth_source = header
+}
+
+rule AuthenticateViaQuery {
+    when: EnvelopeReceived(envelope, _, query_string)
+
+    requires:
+        query_string != null
+
+    let credentials = parse_query_auth(query_string)
+    let project = envelope.project
+
+    requires:
+        credentials != null
+        project.public_key = credentials.sentry_key
+
+    ensures:
+        envelope.auth = credentials
+        envelope.auth.auth_source = query
+}
+
+rule AuthenticateViaEnvelopeDsn {
+    when: EnvelopeReceived(envelope, _, _)
+
+    let dsn = extract_envelope_dsn(envelope)
+    let project = envelope.project
+
+    requires:
+        dsn != null
+        project.public_key = dsn.public_key
+
+    ensures:
+        envelope.auth = AuthCredentials{
+            sentry_key: dsn.public_key,
+            sentry_version: 7,
+            auth_source: envelope_dsn
+        }
+}
+
+-- Project management
+
+rule CreateProjectOnFirstEvent {
+    when: EnvelopeReceived(envelope, _, _)
+
+    let project_id = envelope.project_id
+    let sentry_key = envelope.auth.sentry_key
+
+    requires:
+        not exists Project{project_id}
+        config.auto_create_projects
+
+    ensures:
+        Project.created(
+            project_id: project_id,
+            name: project_id,
+            public_key: sentry_key,
+            created_at: now
+        )
+}
+
+rule EnsureProjectExists {
+    when: EnvelopeReceived(envelope, _, _)
+
+    let project_id = envelope.project_id
+    let sentry_key = envelope.auth.sentry_key
+
+    requires:
+        exists Project{project_id}
+
+    let project = Project{project_id}
+
+    ensures:
+        if project.public_key != sentry_key:
+            AuthFailed(reason: "invalid_key")
+}
+
+-- Envelope processing
+
+rule ProcessEnvelopeItems {
+    when: AuthValidated(envelope, project)
+
+    let items = envelope.items
+
+    for item in items:
+        if item.is_event:
+            ProcessEventItem(item, project)
+        else if item.is_attachment:
+            ProcessAttachmentItem(item, project, envelope.event_id)
+        else if item.is_session:
+            ProcessSessionItem(item, project)
+        else if item.item_type = check_in:
+            ProcessCheckInItem(item, project)
+        else:
+            ProcessUnknownItem(item, project)
+
+    ensures:
+        envelope.items_processed = items.where(i => i.is_event or i.is_attachment or i.is_session or i.item_type = check_in).count
+        envelope.items_skipped = items.where(i => not i.is_event and not i.is_attachment and not i.is_session and i.item_type != check_in).count
+}
+
+rule ProcessEventItem {
+    when: EnvelopeItemReceived(item, project)
+
+    requires:
+        item.is_event
+        item.payload.size < config.max_event_size
+
+    let event_data = parse_event_json(item.payload)
+    let event_id = event_data.event_id ?? generate_uuid()
+
+    ensures:
+        StoredEvent.created(
+            event_id: event_id,
+            project: project,
+            timestamp: event_data.timestamp ?? now,
+            level: event_data.level ?? error,
+            platform: event_data.platform,
+            message: event_data.message,
+            environment: event_data.environment,
+            release: event_data.release,
+            transaction_name: event_data.transaction,
+            is_transaction: item.item_type = transaction,
+            raw_json: item.payload
+        )
+        EventStored(event_id: event_id, project: project)
+}
+
+rule ProcessAttachmentItem {
+    when: EnvelopeItemReceived(item, project, event_id)
+
+    requires:
+        item.is_attachment
+        event_id != null
+        item.filename != null
+
+    ensures:
+        StoredAttachment.created(
+            attachment_id: generate_uuid(),
+            event: StoredEvent{event_id},
+            project: project,
+            filename: item.filename,
+            content_type: item.content_type,
+            file_path: compute_attachment_path(project, event_id, item.filename),
+            size: item.payload.size,
+            uploaded_at: now
+        )
+}
+
+rule ProcessSessionItem {
+    when: EnvelopeItemReceived(item, project)
+
+    requires:
+        item.is_session
+
+    let session_data = parse_session_json(item.payload)
+
+    ensures:
+        SessionUpdate.created(
+            session_id: session_data.session_id,
+            project: project,
+            distinct_id: session_data.distinct_id,
+            started: session_data.started,
+            status: session_data.status,
+            duration: session_data.duration,
+            error_count: session_data.errors,
+            release: session_data.release,
+            environment: session_data.environment,
+            timestamp: now
+        )
+}
+
+rule ProcessCheckInItem {
+    when: EnvelopeItemReceived(item, project)
+
+    requires:
+        item.item_type = check_in
+
+    let check_in_data = parse_check_in_json(item.payload)
+
+    ensures:
+        CheckIn.created(
+            check_in_id: check_in_data.check_in_id ?? generate_uuid(),
+            project: project,
+            monitor_slug: check_in_data.monitor_slug,
+            status: check_in_data.status,
+            duration: check_in_data.duration,
+            schedule: check_in_data.schedule,
+            release: check_in_data.release,
+            environment: check_in_data.environment,
+            timestamp: now
+        )
+}
+
+-- Event broadcasting for WebSocket clients
+
+rule BroadcastStoredEvent {
+    when: EventStored(event_id, project)
+
+    let event = StoredEvent{event_id}
+
+    ensures:
+        for conn in WebSocketConnections where project = this and is_active:
+            WebSocketMessageSent(
+                connection: conn,
+                message: event.raw_json
+            )
+}
+
+-- WebSocket connection management
+
+rule AcceptWebSocketConnection {
+    when: WebSocketUpgradeRequested(project_id)
+
+    requires:
+        exists Project{project_id}
+
+    let project = Project{project_id}
+
+    ensures:
+        WebSocketConnection.created(
+            connection_id: generate_uuid(),
+            project: project,
+            connected_at: now,
+            last_ping: now,
+            is_active: true
+        )
+}
+
+rule CloseStaleWebSocketConnections {
+    when: _: WebSocketConnection.last_ping + config.ws_stale_timeout <= now
+
+    for conn in WebSocketConnections where is_stale:
+        ensures:
+            conn.is_active = false
+            WebSocketConnectionClosed(connection: conn, reason: stale)
+
+}
+
+-- Management API
+
+rule ListProjects {
+    when: ListProjectsRequested()
+
+    ensures:
+        ProjectsListed(projects: Projects)
+}
+
+rule GetProject {
+    when: GetProjectRequested(project_id)
+
+    requires:
+        exists Project{project_id}
+
+    ensures:
+        ProjectDetailsReturned(project: Project{project_id})
+}
+
+rule DeleteProject {
+    when: DeleteProjectRequested(project_id, api_user)
+
+    requires:
+        exists Project{project_id}
+
+    let project = Project{project_id}
+
+    ensures:
+        not exists project
+        for event in project.events:
+            not exists event
+        for attachment in project.attachments:
+            not exists attachment
+        ProjectDeleted(project_id: project_id, deleted_by: api_user)
+}
+
+rule ListEvents {
+    when: ListEventsRequested(project_id, filter)
+
+    requires:
+        exists Project{project_id}
+
+    let project = Project{project_id}
+    let events = apply_event_filter(project.events, filter)
+
+    ensures:
+        EventsListed(project: project, events: events)
+}
+
+rule GetEvent {
+    when: GetEventRequested(project_id, event_id)
+
+    requires:
+        exists StoredEvent{event_id, project_id}
+
+    let event = StoredEvent{event_id}
+
+    ensures:
+        EventDetailsReturned(event: event)
+}
+
+rule GetProjectStats {
+    when: GetProjectStatsRequested(project_id)
+
+    requires:
+        exists Project{project_id}
+
+    let project = Project{project_id}
+
+    ensures:
+        ProjectStatsReturned(
+            project: project,
+            total_events: project.event_count,
+            error_count: project.error_events.count,
+            recent_activity: project.has_recent_activity
+        )
+}
+
+-- Error handling
+
+rule RejectInvalidAuth {
+    when: AuthValidated(envelope, project)
+
+    requires:
+        envelope.auth = null
+
+    ensures:
+        AuthFailed(reason: "missing_auth")
+        EnvelopeRejected(envelope: envelope, reason: "missing_auth")
+}
+
+rule RejectInvalidEnvelope {
+    when: EnvelopeReceived(envelope, _, _)
+
+    let parse_result = parse_envelope(envelope.raw_data)
+
+    requires:
+        parse_result = null
+
+    ensures:
+        EnvelopeRejected(envelope: envelope, reason: "invalid_format")
+}
+
+rule RejectOversizedPayload {
+    when: EnvelopeReceived(envelope, _, _)
+
+    requires:
+        envelope.raw_data.size > config.max_compressed_size
+
+    ensures:
+        EnvelopeRejected(envelope: envelope, reason: "payload_too_large")
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueEventIds {
+    for a in StoredEvents:
+        for b in StoredEvents:
+            a != b implies a.event_id != b.event_id
+}
+
+invariant ProjectHasEvents {
+    for project in Projects:
+        for event in project.events:
+            event.project = project
+}
+
+invariant AttachmentBelongsToEvent {
+    for attachment in StoredAttachments:
+        attachment.event.project = attachment.project
+}
+
+invariant AuthVersionSeven {
+    for auth in AuthCredentials:
+        auth.validated_at != null implies auth.sentry_version = 7
+}
+
+invariant WebSocketStaleDetection {
+    for conn in WebSocketConnections:
+        conn.is_active = false implies conn.last_ping < now - 5.minutes
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ApiOperator {
+    identified_by: ApiUser where user_id != null
+}
+
+actor SentrySdk {
+    identified_by: SentryClient
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- SDK envelope ingestion endpoint
+surface EnvelopeIngest {
+    facing sdk: SentrySdk
+
+    context project: Project
+
+    exposes:
+        project.project_id
+        project.public_key
+
+    provides:
+        SubmitEnvelope(sdk, envelope_data, auth_header?)
+        SubmitEvent(sdk, event_json, auth_header?) -- legacy /store/ endpoint
+        SubmitMinidump(sdk, multipart_data, auth_header?)
+        SubmitChunk(sdk, chunk_data, auth_header?)
+
+    @guarantee AuthenticatedAccess
+        -- All submissions must present valid authentication
+        -- via header, query params, or envelope DSN.
+
+    @guarantee ProjectAutoCreation
+        -- Projects are created automatically on first event
+        -- when auto_create_projects is enabled.
+
+    @guarantee AtomicProcessing
+        -- All items in an envelope are processed atomically;
+        -- partial failures result in full rejection.
+
+    @guidance
+        -- Clients should implement exponential backoff on
+        -- 429 (rate limit) or 5xx responses.
+        -- GZIP compression is recommended for large payloads.
+}
+
+-- Management API for project and event data
+surface ManagementApi {
+    facing operator: ApiOperator
+
+    provides:
+        ListProjects()
+        CreateProject(project_id, name, public_key?)
+        GetProject(project_id)
+        DeleteProject(project_id)
+        ListEvents(project_id, filter?)
+        GetEvent(project_id, event_id)
+        ListTransactions(project_id, filter?)
+        GetProjectStats(project_id)
+        ListReleases(project_id)
+        ListAttachments(project_id, event_id)
+
+    @guarantee IdempotentReads
+        -- GET requests are safe to retry with same parameters.
+
+    @guarantee CascadingDelete
+        -- Deleting a project removes all associated events,
+        -- attachments, and metadata.
+
+    @guidance
+        -- Use pagination filters (limit, cursor) for large datasets.
+        -- Event filtering supports level, environment, release,
+        -- and full-text search on message/exception fields.
+}
+
+-- WebSocket endpoint for live event streaming
+surface EventStreaming {
+    facing client: SentrySdk
+
+    context project: Project
+
+    exposes:
+        project.project_id
+
+    provides:
+        SubscribeToEvents(project_id)
+        UnsubscribeFromEvents(project_id)
+
+    @guarantee RealtimeDelivery
+        -- Events are broadcast to subscribers immediately
+        -- after successful storage.
+
+    @guarantee ConnectionManagement
+        -- Stale connections are closed automatically after
+        -- ws_stale_timeout duration.
+
+    @guidance
+        -- Clients should implement ping/pong to keep connections
+        -- alive and handle reconnection gracefully.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should we support per-project rate limiting beyond global max size?"
+open question "What is the retention policy for stored events and attachments?"
+open question "Should we support event replay/redelivery after the fact?"

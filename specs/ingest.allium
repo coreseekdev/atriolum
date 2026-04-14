@@ -1,0 +1,685 @@
+-- allium: 3
+-- Ingest Processing
+-- Defines the envelope processing and validation pipeline
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    validator: AuthValidator
+    decompressor: BodyDecompressor
+    parser: EnvelopeParser
+    processor: ItemProcessor
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- HTTP client making the request
+external entity HttpClient {
+    ip_address: String?
+    user_agent: String?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Parsed authentication data
+value AuthData {
+    sentry_key: String
+    sentry_version: Integer
+    sentry_client: String?
+    sentry_secret: String?
+    source: AuthSource
+    is_valid: Boolean
+    error_message: String?
+}
+
+-- Decompression result
+value DecompressionResult {
+    data: String
+    original_size: Integer
+    decompressed_size: Integer
+    encoding: CompressionEncoding?
+}
+
+-- Parse result for envelope
+value EnvelopeParseResult {
+    envelope: Envelope?
+    error_message: String?
+    items_parsed: Integer
+    items_skipped: Integer
+}
+
+-- Processing result
+value ProcessingResult {
+    event_id: String?
+    items_processed: Integer
+    items_skipped: Integer
+    status: ProcessingStatus
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Source of authentication credentials
+enum AuthSource {
+    x_sentry_auth_header
+    query_parameters
+    envelope_dsn
+}
+
+-- Compression encoding
+enum CompressionEncoding {
+    gzip
+    br
+    deflate
+    identity
+}
+
+-- Processing status
+enum ProcessingStatus {
+    success
+    partial_success
+    authentication_failed
+    validation_failed
+    quota_exceeded
+    internal_error
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An incoming HTTP request for ingestion
+entity IngestRequest {
+    request_id: String
+    method: String
+    path: String
+    auth_header: String?
+    query_string: String?
+    body: String
+    content_encoding: String?
+    content_type: String?
+    client_ip: String?
+    received_at: Timestamp
+    project_id: String?
+
+    -- Derived
+    is_envelope_endpoint: path.contains("/envelope")
+    is_store_endpoint: path.contains("/store")
+    is_minidump_endpoint: path.contains("/minidump")
+    has_auth: auth_header != null or query_string != null
+    is_compressed: content_encoding != null
+}
+
+-- Authentication validation result
+entity AuthValidation {
+    request_id: String
+    auth_data: AuthData?
+    is_valid: Boolean
+    project_id: String?
+    validated_at: Timestamp
+    rejection_reason: String?
+
+    -- Derived
+    can_proceed: is_valid and project_id != null
+}
+
+-- Envelope processing state
+entity EnvelopeProcessing {
+    processing_id: String
+    request_id: String
+    project_id: String
+    envelope: Envelope?
+    status: ProcessingStatus
+    started_at: Timestamp
+    completed_at: Timestamp?
+    result: ProcessingResult?
+
+    -- Derived
+    duration: completed_at - started_at
+    is_complete: completed_at != null
+    failed: status in {authentication_failed, validation_failed, internal_error}
+}
+
+-- Item processing result
+entity ItemProcessing {
+    item_id: String
+    processing_id: String
+    item_type: EnvelopeItemType
+    status: ProcessingStatus
+    storage_path: String?
+    error_message: String?
+    processed_at: Timestamp
+
+    -- Derived
+    succeeded: status = success
+    is_attachment: item_type = attachment
+    is_event: item_type in {event, transaction}
+}
+
+-- Rate limit state
+entity RateLimitState {
+    project_id: String
+    window_start: Timestamp
+    request_count: Integer
+    limit: Integer
+
+    -- Derived
+    is_exceeded: request_count >= limit
+    window_ends: window_start + 1.minutes
+}
+
+-- Decompression operation
+entity DecompressionOperation {
+    request_id: String
+    original_size: Integer
+    decompressed_size: Integer
+    encoding: CompressionEncoding?
+    status: ProcessingStatus
+    started_at: Timestamp
+    completed_at: Timestamp?
+
+    -- Derived
+    compression_ratio: if decompressed_size > 0: original_size / decompressed_size else: 0
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Maximum compressed request body size
+    max_compressed_size: Integer = 20_971_520
+
+    -- Maximum decompressed size
+    max_decompressed_size: Integer = 100_663_296
+
+    -- Protocol version to accept
+    accepted_protocol_version: Integer = 7
+
+    -- Rate limit per project per minute
+    rate_limit_per_minute: Integer = 100
+
+    -- Maximum envelope items per request
+    max_items_per_envelope: Integer = 1000
+
+    -- Timeout for processing
+    processing_timeout: Duration = 30.seconds
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Request validation flow
+
+rule ValidateIngestRequest {
+    when: IngestRequestReceived(request)
+
+    requires:
+        request.method = "POST"
+        request.path.contains("/api/")
+
+    ensures:
+        IngestRequest.validated_at = now
+        RequestValidationPassed(request_id: request.request_id)
+}
+
+rule RejectOversizedRequest {
+    when: IngestRequestReceived(request)
+
+    requires:
+        request.body.length > config.max_compressed_size
+
+    ensures:
+        IngestRequest.rejected = true
+        IngestRequest.rejection_reason = "payload_too_large"
+        RequestRejected(request_id: request.request_id, reason: "payload_too_large", status: 413)
+}
+
+-- Decompression
+
+rule DecompressGzipBody {
+    when: RequestValidationPassed(request_id)
+
+    let request = IngestRequest{request_id}
+
+    requires:
+        request.is_compressed
+        request.content_encoding = "gzip"
+
+    ensures:
+        let decompressed = decompress_gzip(request.body)
+        DecompressionOperation.created(
+            request_id: request_id,
+            original_size: request.body.length,
+            decompressed_size: decompressed.data.length,
+            encoding: gzip,
+            status: if decompressed.data.length > 0: success else: validation_failed,
+            started_at: now,
+            completed_at: now
+        )
+        BodyDecompressed(request_id: request_id, data: decompressed.data)
+}
+
+rule DecompressBrotliBody {
+    when: RequestValidationPassed(request_id)
+
+    let request = IngestRequest{request_id}
+
+    requires:
+        request.is_compressed
+        request.content_encoding = "br"
+
+    ensures:
+        let decompressed = decompress_brotli(request.body)
+        DecompressionOperation.created(
+            request_id: request_id,
+            original_size: request.body.length,
+            decompressed_size: decompressed.data.length,
+            encoding: br,
+            status: if decompressed.data.length > 0: success else: validation_failed,
+            started_at: now,
+            completed_at: now
+        )
+        BodyDecompressed(request_id: request_id, data: decompressed.data)
+}
+
+rule PassThroughUncompressedBody {
+    when: RequestValidationPassed(request_id)
+
+    let request = IngestRequest{request_id}
+
+    requires:
+        not request.is_compressed
+
+    ensures:
+        BodyDecompressed(request_id: request_id, data: request.body)
+}
+
+-- Authentication
+
+rule AuthenticateViaHeader {
+    when: BodyDecompressed(request_id, data)
+
+    let request = IngestRequest{request_id}
+
+    requires:
+        request.auth_header != null
+
+    let auth_data = parse_auth_header(request.auth_header)
+
+    ensures:
+        AuthValidation.created(
+            request_id: request_id,
+            auth_data: auth_data,
+            is_valid: auth_data.is_valid,
+            project_id: request.project_id,
+            validated_at: now,
+            rejection_reason: if not auth_data.is_valid: auth_data.error_message
+        )
+        if auth_data.is_valid:
+            AuthAuthenticated(request_id: request_id, auth_data: auth_data)
+        else:
+            AuthFailed(request_id: request_id, reason: auth_data.error_message ?? "invalid_auth")
+}
+
+rule AuthenticateViaQuery {
+    when: BodyDecompressed(request_id, data)
+
+    let request = IngestRequest{request_id}
+
+    requires:
+        request.auth_header = null
+        request.query_string != null
+
+    let auth_data = parse_query_auth(request.query_string)
+
+    ensures:
+        AuthValidation.created(
+            request_id: request_id,
+            auth_data: auth_data,
+            is_valid: auth_data.is_valid,
+            project_id: request.project_id,
+            validated_at: now,
+            rejection_reason: if not auth_data.is_valid: auth_data.error_message
+        )
+        if auth_data.is_valid:
+            AuthAuthenticated(request_id: request_id, auth_data: auth_data)
+        else:
+            AuthFailed(request_id: request_id, reason: auth_data.error_message ?? "invalid_auth")
+}
+
+rule AuthenticateViaEnvelopeDsn {
+    when: BodyDecompressed(request_id, data)
+
+    let request = IngestRequest{request_id}
+
+    requires:
+        request.auth_header = null
+        request.query_string = null
+
+    let envelope_dsn = extract_dsn_from_envelope(data)
+    let auth_data = if envelope_dsn != null: parse_dsn_auth(envelope_dsn) else: null
+
+    ensures:
+        if auth_data != null and auth_data.is_valid:
+            AuthValidation.created(
+                request_id: request_id,
+                auth_data: auth_data,
+                is_valid: true,
+                project_id: request.project_id,
+                validated_at: now,
+                rejection_reason: null
+            )
+            AuthAuthenticated(request_id: request_id, auth_data: auth_data)
+        else:
+            AuthFailed(request_id: request_id, reason: "missing_auth")
+}
+
+-- Envelope parsing
+
+rule ParseEnvelope {
+    when: AuthAuthenticated(request_id, auth_data)
+
+    let request = IngestRequest{request_id}
+    let body = DecompressionOperation{request_id}.decompressed_data ?? request.body
+
+    let parse_result = parse_envelope(body)
+
+    ensures:
+        EnvelopeProcessing.created(
+            processing_id: generate_uuid(),
+            request_id: request_id,
+            project_id: request.project_id,
+            envelope: parse_result.envelope,
+            status: if parse_result.envelope != null: success else: validation_failed,
+            started_at: now,
+            completed_at: if parse_result.envelope != null: now else: null,
+            result: null
+        )
+        if parse_result.envelope != null:
+            EnvelopeParsed(processing_id: EnvelopeProcessing{request_id}.processing_id, envelope: parse_result.envelope)
+        else:
+            EnvelopeParseFailed(request_id: request_id, reason: parse_result.error_message ?? "invalid_envelope")
+}
+
+-- Item processing
+
+rule ProcessEnvelopeItems {
+    when: EnvelopeParsed(processing_id, envelope)
+
+    let processing = EnvelopeProcessing{processing_id}
+
+    for item in envelope.items:
+        ProcessItem(processing_id, item)
+
+    ensures:
+        processing.completed_at = now
+        processing.result = ProcessingResult{
+            event_id: envelope.header.event_id,
+            items_processed: envelope.items.count,
+            items_skipped: 0,
+            status: success
+        }
+        EnvelopeProcessingComplete(processing_id: processing_id, result: processing.result)
+}
+
+rule ProcessEventItem {
+    when: ProcessItem(processing_id, item)
+
+    let processing = EnvelopeProcessing{processing_id}
+
+    requires:
+        item.header.type in {event, transaction}
+
+    let event_data = parse_event_payload(item.payload)
+    let event_id = event_data.event_id ?? envelope.header.event_id ?? generate_uuid()
+
+    ensures:
+        ItemProcessing.created(
+            item_id: generate_uuid(),
+            processing_id: processing_id,
+            item_type: item.header.type,
+            status: success,
+            storage_path: compute_event_path(processing.project_id, event_id),
+            error_message: null,
+            processed_at: now
+        )
+        EventStored(event_id: event_id, project_id: processing.project_id, data: event_data)
+}
+
+rule ProcessAttachmentItem {
+    when: ProcessItem(processing_id, item)
+
+    let processing = EnvelopeProcessing{processing_id}
+
+    requires:
+        item.header.type = attachment
+        item.header.filename != null
+
+    let event_id = processing.envelope.header.event_id ?? "unknown"
+
+    ensures:
+        ItemProcessing.created(
+            item_id: generate_uuid(),
+            processing_id: processing_id,
+            item_type: attachment,
+            status: success,
+            storage_path: compute_attachment_path(processing.project_id, event_id, item.header.filename),
+            error_message: null,
+            processed_at: now
+        )
+        AttachmentStored(project_id: processing.project_id, event_id: event_id, filename: item.header.filename, data: item.payload)
+}
+
+rule ProcessSessionItem {
+    when: ProcessItem(processing_id, item)
+
+    let processing = EnvelopeProcessing{processing_id}
+
+    requires:
+        item.header.type in {session, sessions}
+
+    let session_data = parse_session_payload(item.payload)
+
+    ensures:
+        ItemProcessing.created(
+            item_id: generate_uuid(),
+            processing_id: processing_id,
+            item_type: item.header.type,
+            status: success,
+            storage_path: compute_session_path(processing.project_id, format_date_key(now)),
+            error_message: null,
+            processed_at: now
+        )
+        SessionStored(project_id: processing.project_id, session_id: session_data.session_id, data: session_data)
+}
+
+rule ProcessCheckInItem {
+    when: ProcessItem(processing_id, item)
+
+    let processing = EnvelopeProcessing{processing_id}
+
+    requires:
+        item.header.type = check_in
+
+    let check_in_data = parse_check_in_payload(item.payload)
+
+    ensures:
+        ItemProcessing.created(
+            item_id: generate_uuid(),
+            processing_id: processing_id,
+            item_type: check_in,
+            status: success,
+            storage_path: compute_check_in_path(processing.project_id, check_in_data.monitor_slug),
+            error_message: null,
+            processed_at: now
+        )
+        CheckInStored(project_id: processing.project_id, monitor_slug: check_in_data.monitor_slug, data: check_in_data)
+}
+
+rule SkipUnknownItemType {
+    when: ProcessItem(processing_id, item)
+
+    requires:
+        item.header.type not in {event, transaction, attachment, session, sessions, check_in}
+
+    ensures:
+        ItemProcessing.created(
+            item_id: generate_uuid(),
+            processing_id: processing_id,
+            item_type: item.header.type,
+            status: success,
+            storage_path: null,
+            error_message: null,
+            processed_at: now
+        )
+        UnknownItemSkipped(item_type: item.header.type)
+}
+
+-- Rate limiting
+
+rule CheckRateLimit {
+    when: AuthAuthenticated(request_id, auth_data)
+
+    let project_id = IngestRequest{request_id}.project_id
+
+    requires:
+        project_id != null
+
+    if exists RateLimitState{project_id}:
+        let state = RateLimitState{project_id}
+        ensures:
+            if state.is_exceeded:
+                RateLimitExceeded(project_id: project_id)
+                RequestRejected(request_id: request_id, reason: "rate_limit_exceeded", status: 429)
+            else if now > state.window_ends:
+                RateLimitState{project_id}.window_start = now
+                RateLimitState{project_id}.request_count = 1
+            else:
+                RateLimitState{project_id}.request_count = RateLimitState{project_id}.request_count + 1
+    else:
+        ensures:
+            RateLimitState.created(
+                project_id: project_id,
+                window_start: now,
+                request_count: 1,
+                limit: config.rate_limit_per_minute
+            )
+}
+
+-- Error handling
+
+rule HandleAuthFailure {
+    when: AuthFailed(request_id, reason)
+
+    ensures:
+        RequestRejected(request_id: request_id, reason: reason, status: 403)
+        AuthValidation{request_id}.is_valid = false
+}
+
+rule HandleParseFailure {
+    when: EnvelopeParseFailed(request_id, reason)
+
+    ensures:
+        RequestRejected(request_id: request_id, reason: reason, status: 400)
+        EnvelopeProcessing{request_id}.status = validation_failed
+        EnvelopeProcessing{request_id}.completed_at = now
+}
+
+rule HandleDecompressionFailure {
+    when: DecompressionFailed(request_id, reason)
+
+    ensures:
+        RequestRejected(request_id: request_id, reason: reason, status: 400)
+        DecompressionOperation{request_id}.status = validation_failed
+        DecompressionOperation{request_id}.completed_at = now
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant RequestIdUnique {
+    for a in IngestRequests:
+        for b in IngestRequests:
+            a != b implies a.request_id != b.request_id
+}
+
+invariant ProcessingHasRequest {
+    for processing in EnvelopeProcessings:
+        exists IngestRequest{request_id: processing.request_id}
+}
+
+invariant ItemProcessingHasParent {
+    for item in ItemProcessings:
+        exists EnvelopeProcessing{processing_id: item.processing_id}
+}
+
+invariant RateLimitWindowExpiry {
+    for state in RateLimitStates:
+        now > state.window_ends implies state.request_count = 0
+}
+
+invariant AuthValidationRequiresRequest {
+    for validation in AuthValidations:
+        exists IngestRequest{request_id: validation.request_id}
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor IngestClient {
+    identified_by: HttpClient
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EnvelopeIngestApi {
+    facing client: IngestClient
+
+    provides:
+        SubmitEnvelope(auth_header?, body, content_encoding?)
+        SubmitEvent(auth_header?, body) -- legacy /store/ endpoint
+        SubmitMinidump(auth_header?, multipart_body)
+        SubmitChunk(auth_header?, chunk_data)
+
+    @guarantee AuthenticatedAccess
+        -- All submissions require valid authentication via
+        -- header, query params, or envelope DSN.
+
+    @guarantee SizeLimits
+        -- Requests exceeding max_compressed_size are rejected
+        -- with 413 status before decompression.
+
+    @guarantee RateLimiting
+        -- Per-project rate limits are enforced to prevent
+        -- abuse.
+
+    @guarantee AtomicProcessing
+        -- All items in an envelope are processed atomically;
+        -- failures result in full rejection.
+
+    @guidance
+        -- Use /envelope endpoint for all new SDK integrations.
+        -- Legacy /store endpoint wraps events as single-item envelopes.
+        -- GZIP compression is recommended for payloads > 1KB.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should we implement per-project rate limiting tiers?"
+open question "What is the behaviour for envelopes with mixed valid/invalid items?"
+open question "Should we support request queuing during rate limit exhaustion?"

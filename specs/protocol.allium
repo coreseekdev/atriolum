@@ -1,0 +1,415 @@
+-- allium: 3
+-- Sentry Protocol Types
+-- Defines the core data structures for Sentry event ingestion
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The client SDK that sends data
+external entity Sdk {
+    name: String
+    version: String
+    package: String?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Log entry with structured parameters
+value LogEntry {
+    message: String
+    params: List<String>
+}
+
+-- Exception in a stack trace
+value ExceptionValue {
+    type: String?
+    value: String?
+    module: String?
+    stacktrace: Stacktrace?
+}
+
+-- Stack trace with frame data
+value Stacktrace {
+    frames: List<StackFrame>
+}
+
+-- Single stack frame
+value StackFrame {
+    filename: String?
+    abs_path: String?
+    function: String?
+    module: String?
+    lineno: Integer?
+    colno: Integer?
+    context_line: String?
+    pre_context: List<String>?
+    post_context: List<String>?
+    in_app: Boolean?
+}
+
+-- Breadcrumb for event trail
+value Breadcrumb {
+    timestamp: Timestamp?
+    type: String?
+    category: String?
+    message: String?
+    level: Level
+    data: Map<String, String>
+}
+
+-- Thread information
+value Thread {
+    id: String?
+    name: String?
+    stacktrace: Stacktrace?
+    crashed: Boolean?
+    current: Boolean?
+}
+
+-- User context
+value UserContext {
+    id: String?
+    email: String?
+    ip_address: String?
+    username: String?
+    segment: String?
+    name: String?
+}
+
+-- HTTP request context
+value RequestContext {
+    url: String?
+    method: String?
+    headers: Map<String, String>?
+    cookies: String?
+    query_string: String?
+    data: String?
+    env: Map<String, String>?
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Event severity levels
+enum Level {
+    fatal
+    error
+    warning
+    info
+    debug
+}
+
+-- Session status values
+enum SessionStatusCode {
+    ok
+    exited
+    crashed
+    abnormal
+}
+
+-- Check-in status for cron monitoring
+enum CheckInStatusCode {
+    in_progress
+    ok
+    error
+}
+
+-- Monitor schedule types
+enum ScheduleType {
+    crontab
+    interval
+}
+
+-- Known envelope item types
+enum EnvelopeItemType {
+    event
+    transaction
+    attachment
+    session
+    sessions
+    client_report
+    user_report
+    feedback
+    log
+    span
+    check_in
+    profile
+    profile_chunk
+    replay_event
+    replay_recording
+    metric
+    trace_metric
+    raw_security
+    statsd
+    metric_meta
+    user_feedback
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Sentry event payload
+entity Event {
+    event_id: String
+    timestamp: Timestamp
+    platform: String?
+    level: Level
+    logger: String?
+    transaction: String?
+    server_name: String?
+    release: String?
+    dist: String?
+    environment: String?
+    fingerprint: List<String>
+    tags: Map<String, String>?
+    extra: Map<String, String>?
+    modules: Map<String, String>?
+    logentry: LogEntry?
+    message: String?
+    exception: ExceptionValue?
+    breadcrumbs: List<Breadcrumb>?
+    contexts: Map<String, String>?
+    user: UserContext?
+    request: RequestContext?
+    threads: List<Thread>?
+    sdk: Sdk?
+    culprit: String?
+    start_timestamp: Timestamp?
+    spans: List<String>?
+    measurements: Map<String, Decimal>?
+    transaction_info: Map<String, String>?
+    debug_meta: Map<String, String>?
+
+    -- Derived
+    is_error: level in {fatal, error}
+    is_transaction: transaction != null
+    has_user: user != null
+    has_exception: exception != null
+}
+
+-- Envelope header metadata
+entity EnvelopeHeader {
+    event_id: String?
+    dsn: String?
+    sdk: Sdk?
+    sent_at: Timestamp?
+
+    -- Derived
+    has_dsn: dsn != null
+    has_sdk: sdk != null
+}
+
+-- Envelope item header
+entity EnvelopeItemHeader {
+    type: EnvelopeItemType
+    length: Integer?
+    content_type: String?
+    filename: String?
+    attachment_type: String?
+
+    -- Derived
+    is_known_type: type in {event, transaction, attachment, session, check_in, span, log}
+}
+
+-- Complete envelope with items
+entity Envelope {
+    header: EnvelopeHeader
+    items: List<EnvelopeItem>
+
+    -- Derived
+    event_count: items.where(i => i.type = event).count
+    has_attachments: items.any(i => i.type = attachment)
+    has_session: items.any(i => i.type in {session, sessions})
+}
+
+-- Individual envelope item
+entity EnvelopeItem {
+    header: EnvelopeItemHeader
+    payload: String
+
+    -- Derived
+    size: payload.length
+    is_empty: payload.length = 0
+}
+
+-- Session state update
+entity Session {
+    session_id: String
+    distinct_id: String?
+    sequence: Integer?
+    timestamp: Timestamp
+    started: Timestamp
+    init: Boolean
+    duration: Decimal?
+    status: SessionStatusCode
+    errors: Integer
+    release: String?
+    environment: String?
+    ip_address: String?
+    user_agent: String?
+
+    -- Derived
+    is_crashed: status = crashed
+    is_abnormal: status = abnormal
+    has_errors: errors > 0
+}
+
+-- Session aggregates
+entity SessionAggregates {
+    attributes: SessionAttributes?
+    aggregates: List<SessionAggregate>
+}
+
+value SessionAttributes {
+    release: String?
+    environment: String?
+    ip_address: String?
+    user_agent: String?
+}
+
+value SessionAggregate {
+    started: String?
+    exited: Integer?
+    errored: Integer?
+    abnormal: Integer?
+    crashed: Integer?
+}
+
+-- Cron monitor check-in
+entity CheckIn {
+    check_in_id: String?
+    monitor_slug: String
+    status: CheckInStatusCode
+    duration: Decimal?
+    monitor_config: MonitorConfig?
+    release: String?
+    environment: String?
+}
+
+value MonitorConfig {
+    schedule: MonitorSchedule
+    checkin_margin: Integer?
+    max_runtime: Integer?
+    timezone: String?
+}
+
+value MonitorSchedule {
+    schedule_type: ScheduleType
+    value: String
+    interval_unit: String?
+}
+
+-- Performance span
+entity Span {
+    span_id: String
+    trace_id: String
+    parent_span_id: String?
+    op: String?
+    description: String?
+    start_timestamp: Timestamp
+    timestamp: Timestamp?
+    status: String?
+    tags: Map<String, String>?
+    data: Map<String, String>?
+    same_process_as_parent: Boolean?
+    is_segment: Boolean?
+    origin: String?
+
+    -- Derived
+    is_root: parent_span_id = null
+    duration: timestamp - start_timestamp
+}
+
+-- Project DSN configuration
+entity Dsn {
+    scheme: String
+    public_key: String
+    secret_key: String?
+    host: String
+    path: String
+    project_id: String
+
+    -- Derived
+    is_https: scheme = "https"
+    port: Integer?
+}
+
+-- Authentication from X-Sentry-Auth or query
+entity SentryAuth {
+    sentry_key: String
+    sentry_version: Integer
+    sentry_client: String?
+    sentry_secret: String?
+
+    -- Derived
+    is_version_7: sentry_version = 7
+    has_secret: sentry_secret != null
+}
+
+-- Project configuration
+entity ProjectConfig {
+    project_id: String
+    project_name: String
+    keys: List<ProjectKey>
+}
+
+entity ProjectKey {
+    public_key: String
+    secret_key: String?
+
+    -- Derived
+    is_public_only: secret_key = null
+}
+
+-- Structured log entry (envelope item type: "log")
+entity StructuredLogEntry {
+    level: Level
+    message: String?
+    context: Map<String, String>?
+    timestamp: Timestamp
+
+    -- Derived
+    is_error: level in {fatal, error}
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant EventIdFormat {
+    for event in Events:
+        event.event_id.length = 32
+}
+
+invariant SpanIdFormat {
+    for span in Spans:
+        span.span_id.length = 16
+        span.trace_id.length = 32
+}
+
+invariant NonNegativeSessionErrors {
+    for session in Sessions:
+        session.errors >= 0
+}
+
+invariant NonNegativeCheckInDuration {
+    for check_in in CheckIns:
+        check_in.duration != null implies check_in.duration >= 0
+}
+
+invariant ValidTraceParent {
+    for span in Spans:
+        span.parent_span_id != null implies span.parent_span_id.length = 16
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should we validate all enum values against Sentry spec or allow unknown values?"
+open question "What is the maximum allowed size for tags/extra/maps?"

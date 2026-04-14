@@ -1,0 +1,677 @@
+-- allium: 3
+-- Storage Layer
+-- Defines the filesystem storage behaviour and operations
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    filesystem: EventStorage
+    broadcaster: EventBroadcaster
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The application that initiates storage operations
+external entity StorageClient {
+    client_id: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- File path for stored data
+value FilePath {
+    path: String
+    exists: Boolean
+    size: Integer
+}
+
+-- Time-based directory partition
+value MonthPartition {
+    year: Integer
+    month: Integer
+    path: String
+
+    -- Derived
+    partition_key: "{year}-{month}"
+}
+
+-- Storage statistics
+value StorageStats {
+    total_events: Integer
+    total_transactions: Integer
+    total_sessions: Integer
+    total_attachments: Integer
+    total_bytes: Integer
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Storage operation result
+enum StorageResult {
+    success
+    failure
+    quota_exceeded
+    invalid_path
+    already_exists
+}
+
+-- Data type categories for storage
+enum DataType {
+    event
+    transaction
+    session
+    attachment
+    check_in
+    log
+    span
+    profile
+    replay
+    raw
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A stored event file
+entity StoredEventFile {
+    event_id: String
+    project_id: String
+    file_path: FilePath
+    month_partition: MonthPartition
+    size: Integer
+    created_at: Timestamp
+    modified_at: Timestamp
+    data_type: DataType
+
+    -- Relationships
+    project: StoredProject with project_id = this.project_id
+
+    -- Derived
+    is_transaction: data_type = transaction
+    is_recent: created_at > now - 30.days
+    age_days: (now - created_at) / 1.days
+}
+
+-- A project's storage directory
+entity StoredProject {
+    project_id: String
+    name: String
+    created_at: Timestamp
+    base_path: FilePath
+    event_count: Integer
+    transaction_count: Integer
+
+    -- Relationships
+    events: StoredEventFile with project_id = this.project_id and data_type = event
+    transactions: StoredEventFile with project_id = this.project_id and data_type = transaction
+    attachments: StoredAttachment with project_id = this.project_id
+    sessions: StoredSessionFile with project_id = this.project_id
+
+    -- Derived
+    total_items: events.count + transactions.count + sessions.count
+    has_events: events.count > 0
+}
+
+-- A stored attachment file
+entity StoredAttachment {
+    attachment_id: String
+    event_id: String
+    project_id: String
+    filename: String
+    file_path: FilePath
+    content_type: String?
+    size: Integer
+    uploaded_at: Timestamp
+
+    -- Relationships
+    project: StoredProject with project_id = this.project_id
+    event: StoredEventFile with event_id = this.event_id
+
+    -- Derived
+    is_minidump: filename.ends_with(".dmp")
+    is_image: content_type in {"image/png", "image/jpeg", "image/gif"}
+}
+
+-- A stored session file (JSONL format)
+entity StoredSessionFile {
+    date: String
+    project_id: String
+    file_path: FilePath
+    line_count: Integer
+    size: Integer
+    created_at: Timestamp
+
+    -- Relationships
+    project: StoredProject with project_id = this.project_id
+
+    -- Derived
+    is_recent: created_at > now - 7.days
+}
+
+-- A stored check-in file
+entity StoredCheckInFile {
+    check_in_id: String
+    project_id: String
+    monitor_slug: String
+    file_path: FilePath
+    created_at: Timestamp
+
+    -- Relationships
+    project: StoredProject with project_id = this.project_id
+}
+
+-- Broadcast channel for live events
+entity BroadcastChannel {
+    project_id: String?
+    channel_id: String
+    capacity: Integer
+    subscriber_count: Integer
+    created_at: Timestamp
+
+    -- Relationships
+    subscribers: WebSocketSubscriber with channel_id = this.channel_id
+
+    -- Derived
+    is_global: project_id = null
+    is_full: subscriber_count >= capacity
+}
+
+-- WebSocket subscriber to broadcast channel
+entity WebSocketSubscriber {
+    connection_id: String
+    channel: BroadcastChannel
+    connected_at: Timestamp
+    last_ping: Timestamp
+    is_active: Boolean
+
+    -- Derived
+    is_stale: last_ping < now - 5.minutes
+    connection_age: now - connected_at
+}
+
+-- Storage operation record
+entity StorageOperation {
+    operation_id: String
+    data_type: DataType
+    operation: StorageOperationType
+    project_id: String?
+    file_path: FilePath?
+    result: StorageResult
+    started_at: Timestamp
+    completed_at: Timestamp
+    bytes_written: Integer?
+
+    -- Derived
+    duration: completed_at - started_at
+    succeeded: result = success
+    failed: result != success
+}
+
+------------------------------------------------------------
+-- Sum Types
+------------------------------------------------------------
+
+entity StorageOperationType {
+    operation_type: read | write | delete | list
+}
+
+variant Read : StorageOperationType {
+    -- Read-specific fields
+}
+
+variant Write : StorageOperationType {
+    -- Write-specific fields
+    is_atomic: Boolean
+}
+
+variant Delete : StorageOperationType {
+    -- Delete-specific fields
+    is_cascading: Boolean
+}
+
+variant List : StorageOperationType {
+    -- List-specific fields
+    filter: String?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Base directory for all storage
+    base_dir: String = "/var/lib/atriolum"
+
+    -- Broadcast channel capacity
+    broadcast_capacity: Integer = 256
+
+    -- Maximum file size for individual event files
+    max_event_file_size: Integer = 1_048_576
+
+    -- Use atomic writes (write temp file, then rename)
+    atomic_writes: Boolean = true
+
+    -- File permissions for created files
+    file_mode: Integer = 0o644
+
+    -- Directory permissions
+    dir_mode: Integer = 0o755
+
+    -- Retention days for events (0 = unlimited)
+    event_retention_days: Integer = 0
+
+    -- Retention days for attachments
+    attachment_retention_days: Integer = 90
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Project initialization
+
+rule InitializeProjectStorage {
+    when: ProjectStorageCreated(project)
+
+    requires:
+        not exists StoredProject{project_id: project.project_id}
+
+    ensures:
+        StoredProject.created(
+            project_id: project.project_id,
+            name: project.name,
+            created_at: now,
+            base_path: FilePath{path: compute_project_path(project.project_id), exists: true, size: 0},
+            event_count: 0,
+            transaction_count: 0
+        )
+        StorageOperation.created(
+            operation_id: generate_uuid(),
+            data_type: raw,
+            operation: List,
+            project_id: project.project_id,
+            result: success,
+            started_at: now,
+            completed_at: now
+        )
+}
+
+rule EnsureProjectDirectoryExists {
+    when: StoreEventRequested(project_id, event_data)
+
+    requires:
+        not exists StoredProject{project_id}
+
+    ensures:
+        StoredProject.created(
+            project_id: project_id,
+            name: project_id,
+            created_at: now,
+            base_path: FilePath{path: compute_project_path(project_id), exists: true, size: 0},
+            event_count: 0,
+            transaction_count: 0
+        )
+}
+
+-- Event storage
+
+rule StoreEventFile {
+    when: StoreEventRequested(project_id, event_data)
+
+    let project = StoredProject{project_id}
+    let event_id = event_data.event_id
+    let timestamp = event_data.timestamp ?? now
+    let month_key = format_month_partition(timestamp)
+    let file_path = compute_event_path(project_id, month_key, event_id)
+
+    requires:
+        exists project
+        event_data.raw_json.length < config.max_event_file_size
+
+    ensures:
+        StoredEventFile.created(
+            event_id: event_id,
+            project_id: project_id,
+            file_path: FilePath{path: file_path, exists: true, size: event_data.raw_json.length},
+            month_partition: MonthPartition{year: timestamp.year, month: timestamp.month, path: month_key},
+            size: event_data.raw_json.length,
+            created_at: now,
+            modified_at: now,
+            data_type: event_data.data_type
+        )
+        StorageOperation.created(
+            operation_id: generate_uuid(),
+            data_type: event_data.data_type,
+            operation: Write{is_atomic: config.atomic_writes},
+            project_id: project_id,
+            file_path: FilePath{path: file_path, exists: true, size: event_data.raw_json.length},
+            result: success,
+            started_at: now,
+            completed_at: now,
+            bytes_written: event_data.raw_json.length
+        )
+        EventFileStored(event_id: event_id, project_id: project_id, file_path: file_path)
+}
+
+rule AppendToSessionFile {
+    when: StoreSessionRequested(project_id, session_data)
+
+    let date_key = format_date_key(now)
+    let file_path = compute_session_path(project_id, date_key)
+
+    requires:
+        exists StoredProject{project_id}
+
+    ensures:
+        if exists StoredSessionFile{project_id: project_id, date: date_key}:
+            StoredSessionFile{project_id: project_id, date: date_key}.line_count = StoredSessionFile{project_id: project_id, date: date_key}.line_count + 1
+        else:
+            StoredSessionFile.created(
+                date: date_key,
+                project_id: project_id,
+                file_path: FilePath{path: file_path, exists: true, size: session_data.data.length},
+                line_count: 1,
+                size: session_data.data.length,
+                created_at: now
+            )
+        SessionFileAppended(project_id: project_id, date: date_key)
+}
+
+rule StoreAttachmentFile {
+    when: StoreAttachmentRequested(project_id, event_id, filename, data)
+
+    let file_path = compute_attachment_path(project_id, event_id, filename)
+
+    requires:
+        exists StoredProject{project_id}
+        data.length < config.max_event_file_size
+
+    ensures:
+        StoredAttachment.created(
+            attachment_id: generate_uuid(),
+            event_id: event_id,
+            project_id: project_id,
+            filename: filename,
+            file_path: FilePath{path: file_path, exists: true, size: data.length},
+            content_type: detect_content_type(filename, data),
+            size: data.length,
+            uploaded_at: now
+        )
+        AttachmentFileStored(attachment_id: StoredAttachment{project_id: project_id, event_id: event_id, filename: filename}.attachment_id)
+}
+
+-- Broadcasting
+
+rule BroadcastStoredEvent {
+    when: EventFileStored(event_id, project_id, file_path)
+
+    let event_json = read_file_contents(file_path)
+
+    ensures:
+        for channel in BroadcastChannels where project_id = this.project_id:
+            for subscriber in channel.subscribers where is_active:
+                MessageDelivered(connection_id: subscriber.connection_id, message: event_json)
+
+        for global_channel in BroadcastChannels where project_id = null:
+            for subscriber in global_channel.subscribers where is_active:
+                MessageDelivered(connection_id: subscriber.connection_id, message: event_json)
+}
+
+-- Reading operations
+
+rule ReadEventFile {
+    when: ReadEventRequested(project_id, event_id)
+
+    requires:
+        exists StoredEventFile{event_id: event_id, project_id: project_id}
+
+    let event_file = StoredEventFile{event_id: event_id, project_id: project_id}
+    let contents = read_file_contents(event_file.file_path.path)
+
+    ensures:
+        StorageOperation.created(
+            operation_id: generate_uuid(),
+            data_type: event_file.data_type,
+            operation: Read,
+            project_id: project_id,
+            file_path: event_file.file_path,
+            result: success,
+            started_at: now,
+            completed_at: now
+        )
+        EventDataReturned(event_id: event_id, data: contents)
+}
+
+rule ListProjectEvents {
+    when: ListEventsRequested(project_id, filter)
+
+    requires:
+        exists StoredProject{project_id}
+
+    let project = StoredProject{project_id}
+    let events = apply_storage_filter(project.events, filter)
+
+    ensures:
+        EventsListed(project_id: project_id, events: events)
+}
+
+-- Deletion operations
+
+rule DeleteProjectStorage {
+    when: DeleteProjectRequested(project_id)
+
+    requires:
+        exists StoredProject{project_id}
+
+    let project = StoredProject{project_id}
+
+    ensures:
+        not exists project
+        for event in project.events:
+            not exists event
+        for attachment in project.attachments:
+            not exists attachment
+        for session in project.sessions:
+            not exists session
+        StorageOperation.created(
+            operation_id: generate_uuid(),
+            data_type: raw,
+            operation: Delete{is_cascading: true},
+            project_id: project_id,
+            result: success,
+            started_at: now,
+            completed_at: now
+        )
+        ProjectStorageDeleted(project_id: project_id)
+}
+
+-- Broadcast channel management
+
+rule CreateBroadcastChannel {
+    when: SubscribeToEvents(project_id, connection_id)
+
+    requires:
+        not exists BroadcastChannel{project_id: project_id}
+
+    ensures:
+        BroadcastChannel.created(
+            project_id: project_id,
+            channel_id: generate_uuid(),
+            capacity: config.broadcast_capacity,
+            subscriber_count: 1,
+            created_at: now
+        )
+        WebSocketSubscriber.created(
+            connection_id: connection_id,
+            channel: BroadcastChannel{project_id: project_id},
+            connected_at: now,
+            last_ping: now,
+            is_active: true
+        )
+}
+
+rule AddChannelSubscriber {
+    when: SubscribeToEvents(project_id, connection_id)
+
+    requires:
+        exists BroadcastChannel{project_id: project_id}
+
+    let channel = BroadcastChannel{project_id: project_id}
+
+    requires:
+        not channel.is_full
+
+    ensures:
+        WebSocketSubscriber.created(
+            connection_id: connection_id,
+            channel: channel,
+            connected_at: now,
+            last_ping: now,
+            is_active: true
+        )
+        channel.subscriber_count = channel.subscriber_count + 1
+}
+
+rule RemoveStaleSubscriber {
+    when: _: WebSocketSubscriber.last_ping + 5.minutes <= now
+
+    for subscriber in WebSocketSubscribers where is_stale:
+        ensures:
+            not exists subscriber
+            subscriber.channel.subscriber_count = subscriber.channel.subscriber_count - 1
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueEventFilePaths {
+    for a in StoredEventFiles:
+        for b in StoredEventFiles:
+            a != b implies a.file_path.path != b.file_path.path
+}
+
+invariant ProjectPathsUnderBaseDir {
+    for project in StoredProjects:
+        project.base_path.path.starts_with(config.base_dir)
+}
+
+invariant AttachmentBelongsToEvent {
+    for attachment in StoredAttachments:
+        exists StoredEventFile{event_id: attachment.event_id, project_id: attachment.project_id}
+}
+
+invariant NonNegativeFileSizes {
+    for file in StoredEventFiles:
+        file.size >= 0
+    for attachment in StoredAttachments:
+        attachment.size >= 0
+}
+
+invariant BroadcastCapacityNotExceeded {
+    for channel in BroadcastChannels:
+        channel.subscriber_count <= channel.capacity
+}
+
+invariant AtomicWritesCreateTempFile {
+    for op in StorageOperations where op.operation = Write and op.operation.is_atomic:
+        op.file_path.path.ends_with(".tmp") or not op.file_path.path.ends_with(".tmp")
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor StorageWriter {
+    identified_by: StorageClient
+}
+
+actor StorageReader {
+    identified_by: StorageClient
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EventStorage {
+    facing writer: StorageWriter
+
+    exposes:
+        filesystem.base_dir
+
+    provides:
+        StoreEvent(project_id, event_id, data, data_type)
+        StoreSession(project_id, session_data)
+        StoreAttachment(project_id, event_id, filename, data)
+        StoreCheckIn(project_id, check_in_data)
+        StoreRaw(project_id, item_type, data)
+
+    @guarantee AtomicWrites
+        -- When atomic_writes is enabled, writes use temp file
+        -- + rename to prevent partial data on crash.
+
+    @guarantee PathCreation
+        -- Parent directories are created automatically
+        -- before writing files.
+
+    @guidance
+        -- Callers should serialize writes for the same event_id
+        -- to avoid race conditions.
+}
+
+surface EventRetrieval {
+    facing reader: StorageReader
+
+    provides:
+        GetEvent(project_id, event_id)
+        ListEvents(project_id, filter)
+        GetAttachment(project_id, event_id, filename)
+        ListAttachments(project_id, event_id)
+        GetProjectStats(project_id)
+        ListProjects()
+
+    @guarantee SafeReads
+        -- Reads never block writes and vice versa.
+        -- Missing files return null rather than error.
+
+    @guidance
+        -- Use pagination (limit, cursor) for large result sets.
+        -- Filters support level, environment, release, date range.
+}
+
+surface EventBroadcast {
+    facing subscriber: StorageReader
+
+    provides:
+        Subscribe(project_id, connection_id)
+        Unsubscribe(connection_id)
+        Broadcast(project_id, message)
+
+    @guarantee NonBlocking
+        -- Broadcasting never blocks on slow subscribers.
+        -- Slow subscribers miss messages but don't affect others.
+
+    @guarantee AutoCleanup
+        -- Stale subscribers are removed automatically
+        -- after ws_stale_timeout.
+
+    @guidance
+        -- Subscribers should implement local buffering
+        -- to handle message bursts.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should we implement file compaction for old event partitions?"
+open question "What is the strategy for handling disk full scenarios?"
+open question "Should we support compression for stored event files?"
