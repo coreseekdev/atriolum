@@ -324,21 +324,21 @@ fn test_management_api() {
     thread::sleep(Duration::from_secs(3));
     let base = format!("http://127.0.0.1:{port}");
 
-    // 1. GET /api/0/projects/ — empty initially
+    // 1. GET /api/projects/ — empty initially
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/")])
+        .args(["-s", &format!("{base}/api/projects/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
     assert!(body == "[]", "expected empty projects, got: {body}");
 
-    // 2. POST /api/0/projects/ — create project
+    // 2. POST /api/projects/ — create project
     let result = Command::new("curl")
         .args([
             "-s",
             "-X",
             "POST",
-            &format!("{base}/api/0/projects/"),
+            &format!("{base}/api/projects/"),
             "-H",
             "Content-Type: application/json",
             "-d",
@@ -350,17 +350,17 @@ fn test_management_api() {
     assert!(body.contains("42"), "project create response: {body}");
     assert!(body.contains("mykey123"), "project create response: {body}");
 
-    // 3. GET /api/0/projects/ — now has one project
+    // 3. GET /api/projects/ — now has one project
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/")])
+        .args(["-s", &format!("{base}/api/projects/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
     assert!(body.contains("test-project"), "projects list: {body}");
 
-    // 4. GET /api/0/projects/42/ — get single project
+    // 4. GET /api/projects/42/ — get single project
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/42/")])
+        .args(["-s", &format!("{base}/api/projects/42/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
@@ -386,45 +386,45 @@ fn test_management_api() {
         .output()
         .unwrap();
 
-    // 6. GET /api/0/projects/42/events/ — list events
+    // 6. GET /api/projects/42/events/ — list events
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/42/events/")])
+        .args(["-s", &format!("{base}/api/projects/42/events/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
     assert!(body.contains("fc6d8c0c"), "events list: {body}");
 
-    // 7. GET /api/0/projects/42/events/?level=error — filtered
+    // 7. GET /api/projects/42/events/?level=error — filtered
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/42/events/?level=error")])
+        .args(["-s", &format!("{base}/api/projects/42/events/?level=error")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
     assert!(body.contains("fc6d8c0c"), "filtered events: {body}");
 
-    // 8. GET /api/0/projects/42/stats/
+    // 8. GET /api/projects/42/stats/
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/42/stats/")])
+        .args(["-s", &format!("{base}/api/projects/42/stats/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
     assert!(body.contains("total_events"), "stats: {body}");
 
-    // 9. GET /api/0/projects/42/releases/
+    // 9. GET /api/projects/42/releases/
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/42/releases/")])
+        .args(["-s", &format!("{base}/api/projects/42/releases/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);
     assert!(body == "[]", "releases: {body}");
 
-    // 10. DELETE /api/0/projects/42/
+    // 10. DELETE /api/projects/42/
     let result = Command::new("curl")
         .args([
             "-s",
             "-X",
             "DELETE",
-            &format!("{base}/api/0/projects/42/"),
+            &format!("{base}/api/projects/42/"),
         ])
         .output()
         .unwrap();
@@ -433,7 +433,7 @@ fn test_management_api() {
 
     // 11. Verify project is gone
     let result = Command::new("curl")
-        .args(["-s", &format!("{base}/api/0/projects/42/")])
+        .args(["-s", &format!("{base}/api/projects/42/")])
         .output()
         .unwrap();
     let body = String::from_utf8_lossy(&result.stdout);

@@ -42,11 +42,11 @@ atriolum-server ─┬─ atriolum-ingest ──┬─ atriolum-protocol
 ### Management API
 
 ```
-1. GET /api/0/projects/ → list all projects
-2. POST /api/0/projects/ → create project (name, public_key, project_id)
-3. GET /api/0/projects/{id}/events/ → list events with filters
-4. GET /api/0/projects/{id}/stats/ → aggregate statistics
-5. GET /api/0/projects/{id}/releases/ → list releases
+1. GET /api/projects/ → list all projects
+2. POST /api/projects/ → create project (name, public_key, project_id)
+3. GET /api/projects/{id}/events/ → list events with filters
+4. GET /api/projects/{id}/stats/ → aggregate statistics
+5. GET /api/projects/{id}/releases/ → list releases
 ```
 
 ### Live Event Tail (WebSocket)
@@ -153,8 +153,8 @@ atriolum-cli
   │   ├── tail (WebSocket)
   │   └── ping
   ├── HTTP client (reqwest)
-  │   ├── GET /api/0/projects/...
-  │   └── POST/DELETE /api/0/projects/...
+  │   ├── GET /api/projects/...
+  │   └── POST/DELETE /api/projects/...
   ├── WebSocket client (tokio-tungstenite)
   │   └── /ws/cli for live tail
   └── Output formatting

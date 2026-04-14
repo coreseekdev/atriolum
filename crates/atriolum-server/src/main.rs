@@ -143,8 +143,8 @@ async fn handle_request(
         return handle_ws_upgrade(req, state, ws::WsTarget::Term).await;
     }
 
-    // --- Management API (/api/0/...) ---
-    if parts.len() >= 2 && parts[0] == "api" && parts[1] == "0" {
+    // --- Management API (/api/projects/...) ---
+    if parts.len() >= 2 && parts[0] == "api" && parts[1] == "projects" {
         return Ok(handle_management_api(method, parts, req, state, &query).await);
     }
 
@@ -177,7 +177,7 @@ async fn handle_request(
     Ok(error_response(StatusCode::NOT_FOUND, "not found"))
 }
 
-/// Handle management API requests (/api/0/...).
+/// Handle management API requests (/api/projects/...).
 async fn handle_management_api(
     method: Method,
     parts: Vec<&str>,
@@ -185,58 +185,58 @@ async fn handle_management_api(
     state: &Arc<AppState>,
     query: &str,
 ) -> Response<BoxBody> {
-    // GET /api/0/projects/
-    if method == Method::GET && parts == ["api", "0", "projects"] {
+    // GET /api/projects/
+    if method == Method::GET && parts == ["api", "projects"] {
         return api_list_projects(state).await;
     }
 
-    // POST /api/0/projects/
-    if method == Method::POST && parts == ["api", "0", "projects"] {
+    // POST /api/projects/
+    if method == Method::POST && parts == ["api", "projects"] {
         return api_create_project(req, state).await;
     }
 
-    // Routes with project_id: /api/0/projects/{id}/...
-    if parts.len() >= 4 && parts[0] == "api" && parts[1] == "0" && parts[2] == "projects" {
-        let project_id = parts[3];
+    // Routes with project_id: /api/projects/{id}/...
+    if parts.len() >= 3 && parts[0] == "api" && parts[1] == "projects" {
+        let project_id = parts[2];
 
-        // GET /api/0/projects/{id}/
-        if method == Method::GET && parts.len() == 4 {
+        // GET /api/projects/{id}/
+        if method == Method::GET && parts.len() == 3 {
             return api_get_project(state, project_id).await;
         }
 
-        // DELETE /api/0/projects/{id}/
-        if method == Method::DELETE && parts.len() == 4 {
+        // DELETE /api/projects/{id}/
+        if method == Method::DELETE && parts.len() == 3 {
             return api_delete_project(state, project_id).await;
         }
 
         // Sub-resources under project
-        if parts.len() >= 5 {
-            let resource = parts[4];
+        if parts.len() >= 4 {
+            let resource = parts[3];
 
             match resource {
-                // GET /api/0/projects/{id}/events/
-                "events" if method == Method::GET && parts.len() == 5 => {
+                // GET /api/projects/{id}/events/
+                "events" if method == Method::GET && parts.len() == 4 => {
                     return api_list_events(state, project_id, query).await;
                 }
-                // GET /api/0/projects/{id}/events/{eid}/
-                "events" if method == Method::GET && parts.len() == 6 => {
-                    return api_get_event(state, project_id, parts[5]).await;
+                // GET /api/projects/{id}/events/{eid}/
+                "events" if method == Method::GET && parts.len() == 5 => {
+                    return api_get_event(state, project_id, parts[4]).await;
                 }
-                // GET /api/0/projects/{id}/transactions/
-                "transactions" if method == Method::GET && parts.len() == 5 => {
+                // GET /api/projects/{id}/transactions/
+                "transactions" if method == Method::GET && parts.len() == 4 => {
                     return api_list_transactions(state, project_id, query).await;
                 }
-                // GET /api/0/projects/{id}/stats/
-                "stats" if method == Method::GET && parts.len() == 5 => {
+                // GET /api/projects/{id}/stats/
+                "stats" if method == Method::GET && parts.len() == 4 => {
                     return api_get_stats(state, project_id).await;
                 }
-                // GET /api/0/projects/{id}/releases/
-                "releases" if method == Method::GET && parts.len() == 5 => {
+                // GET /api/projects/{id}/releases/
+                "releases" if method == Method::GET && parts.len() == 4 => {
                     return api_list_releases(state, project_id).await;
                 }
-                // GET /api/0/projects/{id}/attachments/{eid}/
-                "attachments" if method == Method::GET && parts.len() == 6 => {
-                    return api_list_attachments(state, project_id, parts[5]).await;
+                // GET /api/projects/{id}/attachments/{eid}/
+                "attachments" if method == Method::GET && parts.len() == 5 => {
+                    return api_list_attachments(state, project_id, parts[4]).await;
                 }
                 _ => {}
             }

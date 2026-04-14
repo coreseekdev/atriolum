@@ -140,16 +140,16 @@ data/
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/0/projects/` | List all projects |
-| POST | `/api/0/projects/` | Create a project |
-| GET | `/api/0/projects/{id}/` | Get project details |
-| DELETE | `/api/0/projects/{id}/` | Delete a project |
-| GET | `/api/0/projects/{id}/events/` | List events (with filters) |
-| GET | `/api/0/projects/{id}/events/{eid}/` | Get single event |
-| GET | `/api/0/projects/{id}/transactions/` | List transactions |
-| GET | `/api/0/projects/{id}/stats/` | Project statistics |
-| GET | `/api/0/projects/{id}/releases/` | List releases |
-| GET | `/api/0/projects/{id}/attachments/{eid}/` | List event attachments |
+| GET | `/api/projects/` | List all projects |
+| POST | `/api/projects/` | Create a project |
+| GET | `/api/projects/{id}/` | Get project details |
+| DELETE | `/api/projects/{id}/` | Delete a project |
+| GET | `/api/projects/{id}/events/` | List events (with filters) |
+| GET | `/api/projects/{id}/events/{eid}/` | Get single event |
+| GET | `/api/projects/{id}/transactions/` | List transactions |
+| GET | `/api/projects/{id}/stats/` | Project statistics |
+| GET | `/api/projects/{id}/releases/` | List releases |
+| GET | `/api/projects/{id}/attachments/{eid}/` | List event attachments |
 
 ### Event Query Parameters
 

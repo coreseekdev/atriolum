@@ -421,7 +421,7 @@ async fn cmd_events_list(
         params.push(format!("environment={e}"));
     }
     let qs = params.join("&");
-    let body = http_get(server, &format!("/api/0/projects/{project}/events/?{qs}")).await?;
+    let body = http_get(server, &format!("/api/projects/{project}/events/?{qs}")).await?;
     let events = body.as_array().cloned().unwrap_or_default();
     print_events_table(&events, format);
     Ok(())
@@ -429,13 +429,13 @@ async fn cmd_events_list(
 
 async fn cmd_events_show(server: &str, event_id: &str, project: Option<&str>) -> Result<()> {
     let project = project.unwrap_or("1");
-    let body = http_get(server, &format!("/api/0/projects/{project}/events/{event_id}/")).await?;
+    let body = http_get(server, &format!("/api/projects/{project}/events/{event_id}/")).await?;
     print_event_detail(&body);
     Ok(())
 }
 
 async fn cmd_projects_list(server: &str, format: &str) -> Result<()> {
-    let body = http_get(server, "/api/0/projects/").await?;
+    let body = http_get(server, "/api/projects/").await?;
     let projects = body.as_array().cloned().unwrap_or_default();
     print_projects_table(&projects, format);
     Ok(())
@@ -454,7 +454,7 @@ async fn cmd_projects_create(
     if let Some(pid) = id {
         body["project_id"] = Value::String(pid.to_string());
     }
-    let result = http_post(server, "/api/0/projects/", &body).await?;
+    let result = http_post(server, "/api/projects/", &body).await?;
     let pid = result["project_id"].as_str().unwrap_or("?");
     let pk = result["keys"][0]["public_key"].as_str().unwrap_or("?");
     println!("{} Project created", "✓".green());
@@ -470,20 +470,20 @@ async fn cmd_projects_create(
 }
 
 async fn cmd_projects_delete(server: &str, project_id: &str) -> Result<()> {
-    http_delete(server, &format!("/api/0/projects/{project_id}/")).await?;
+    http_delete(server, &format!("/api/projects/{project_id}/")).await?;
     println!("{} Project {} deleted", "✓".green(), project_id);
     Ok(())
 }
 
 async fn cmd_projects_show(server: &str, project_id: &str) -> Result<()> {
-    let body = http_get(server, &format!("/api/0/projects/{project_id}/")).await?;
+    let body = http_get(server, &format!("/api/projects/{project_id}/")).await?;
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
 
 async fn cmd_stats(server: &str, project: Option<&str>) -> Result<()> {
     let project = project.unwrap_or("1");
-    let body = http_get(server, &format!("/api/0/projects/{project}/stats/")).await?;
+    let body = http_get(server, &format!("/api/projects/{project}/stats/")).await?;
 
     println!("{} Project {}", "Stats:".bold(), project);
     println!(
@@ -518,7 +518,7 @@ async fn cmd_stats(server: &str, project: Option<&str>) -> Result<()> {
 }
 
 async fn cmd_releases(server: &str, project: &str) -> Result<()> {
-    let body = http_get(server, &format!("/api/0/projects/{project}/releases/")).await?;
+    let body = http_get(server, &format!("/api/projects/{project}/releases/")).await?;
     let releases = body.as_array().cloned().unwrap_or_default();
 
     if releases.is_empty() {
@@ -553,7 +553,7 @@ async fn cmd_transactions(server: &str, project: &str, limit: usize, query: Opti
         params.push(format!("query={}", urlencoding(q)));
     }
     let qs = params.join("&");
-    let body = http_get(server, &format!("/api/0/projects/{project}/transactions/?{qs}")).await?;
+    let body = http_get(server, &format!("/api/projects/{project}/transactions/?{qs}")).await?;
     let txs = body.as_array().cloned().unwrap_or_default();
     print_events_table(&txs, "table");
     Ok(())

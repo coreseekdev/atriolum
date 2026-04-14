@@ -92,7 +92,7 @@ Request processing pipeline covering:
 SDK ingestion endpoints (`/api/{project_id}/envelope`, `/store`)
 
 ### ManagementApi
-Project and event management API (`/api/0/...`)
+Project and event management API (`/api/projects/...`)
 
 ### EventStreaming
 WebSocket endpoint for live event tailing (`/ws/cli`)
